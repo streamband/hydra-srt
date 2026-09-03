@@ -56,6 +56,8 @@ defmodule HydraSrtWeb.Router do
     get "/routes/:route_id/start", RouteController, :start
     get "/routes/:route_id/stop", RouteController, :stop
     get "/routes/:route_id/restart", RouteController, :restart
+    post "/routes/:route_id/stats/reset", RouteController, :reset_stats
+    delete "/routes/:route_id/stats/reset", RouteController, :clear_stats_reset
     get "/routes/:route_id/endpoint-health", RouteController, :endpoint_health
     post "/routes/:id/switch-source", RouteController, :switch_source
     get "/routes/:route_id/destinations", DestinationController, :index

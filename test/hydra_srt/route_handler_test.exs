@@ -61,10 +61,162 @@ defmodule HydraSrt.RouteHandlerTest do
         retry_last_logged_ms: nil,
         retry_circuit_open?: false,
         recovery_blocked?: false,
-        recovering?: false
+        recovering?: false,
+        stats_baseline: nil,
+        stats_reset_at: nil,
+        stats_rebased_at: nil,
+        last_stats: nil
       },
       overrides
     )
+  end
+
+  describe "stats reset counters" do
+    test "extracts numeric source and destination counters" do
+      stats = %{
+        "total-bytes-received" => 1000,
+        "source" => %{
+          "bytes_in_total" => 900,
+          "bytes_in_per_sec" => 10,
+          "srt" => %{
+            "packets-received" => 20,
+            "packets-received-lost" => 2,
+            "rtt-ms" => 5.0
+          }
+        },
+        "destinations" => [
+          %{
+            "id" => "dest-1",
+            "bytes_out_total" => 800,
+            "drops" => 3,
+            "srt" => %{
+              "packets-sent" => 19,
+              "packets-sent-lost" => 1,
+              "rtt-ms" => 6.0
+            }
+          },
+          %{"bytes_out_total" => 500}
+        ]
+      }
+
+      assert RouteHandler.stats_counters(stats) == %{
+               "total-bytes-received" => 1000,
+               {:source, nil} => %{
+                 "bytes_in_total" => 900,
+                 "srt" => %{
+                   "packets-received" => 20,
+                   "packets-received-lost" => 2
+                 }
+               },
+               {:destination, "dest-1"} => %{
+                 "bytes_out_total" => 800,
+                 "drops" => 3,
+                 "srt" => %{"packets-sent" => 19, "packets-sent-lost" => 1}
+               }
+             }
+    end
+
+    test "since_reset omits missing and non-counter fields" do
+      baseline_stats = %{
+        "total-bytes-received" => 100,
+        "source" => %{
+          "bytes_in_total" => 90,
+          "srt" => %{"packets-received" => 10, "packets-received-lost" => 1}
+        },
+        "destinations" => [
+          %{
+            "id" => "dest-1",
+            "bytes_out_total" => 80,
+            "drops" => 2,
+            "srt" => %{"packets-sent" => 8}
+          }
+        ]
+      }
+
+      current_stats = %{
+        "total-bytes-received" => 140,
+        "source" => %{
+          "bytes_in_total" => 120,
+          "srt" => %{"packets-received" => 15, "rtt-ms" => 20.0}
+        },
+        "destinations" => [
+          %{"id" => "dest-1", "bytes_out_total" => 95, "srt" => %{"packets-sent" => 10}}
+        ]
+      }
+
+      reset_at = ~U[2026-09-03 10:00:00.000000Z]
+
+      assert RouteHandler.since_reset(
+               current_stats,
+               RouteHandler.stats_counters(baseline_stats),
+               reset_at,
+               nil
+             ) == %{
+               "reset_at" => "2026-09-03T10:00:00.000000Z",
+               "rebased_at" => nil,
+               "total-bytes-received" => 40,
+               "source" => %{
+                 "bytes_in_total" => 30,
+                 "srt" => %{"packets-received" => 5}
+               },
+               "destinations" => [
+                 %{"id" => "dest-1", "bytes_out_total" => 15, "srt" => %{"packets-sent" => 2}}
+               ]
+             }
+    end
+
+    test "clearing without an active baseline logs no reset event" do
+      Phoenix.PubSub.subscribe(HydraSrt.PubSub, "events:all")
+      data = base_route_data(%{id: "route-clear-noop"})
+
+      assert {:keep_state, next_data, [{:reply, :from, {:ok, nil}}]} =
+               RouteHandler.handle_event({:call, :from}, :clear_stats_reset, :running, data)
+
+      assert next_data.stats_baseline == nil
+      assert next_data.stats_reset_at == nil
+      refute_receive {:event, %{"event_type" => "stats_reset"}}, 100
+    end
+
+    test "clearing an active baseline logs a cleared event" do
+      Phoenix.PubSub.subscribe(HydraSrt.PubSub, "events:all")
+
+      data =
+        base_route_data(%{
+          id: "route-clear-active",
+          stats_baseline: %{{:source, nil} => %{"bytes_in_total" => 10}},
+          stats_reset_at: ~U[2026-09-03 10:00:00.000000Z]
+        })
+
+      assert {:keep_state, next_data, [{:reply, :from, {:ok, nil}}]} =
+               RouteHandler.handle_event({:call, :from}, :clear_stats_reset, :running, data)
+
+      assert next_data.stats_baseline == nil
+      assert next_data.stats_reset_at == nil
+      assert_receive {:event, %{"event_type" => "stats_reset", "reason" => "cleared"}}, 500
+    end
+
+    test "detects counter decreases but not equal or increased values" do
+      baseline = %{
+        {:source, nil} => %{"srt" => %{"packets-received" => 10}},
+        "total-bytes-received" => 20
+      }
+
+      assert RouteHandler.counters_regressed?(
+               %{
+                 {:source, nil} => %{"srt" => %{"packets-received" => 9}},
+                 "total-bytes-received" => 20
+               },
+               baseline
+             )
+
+      refute RouteHandler.counters_regressed?(
+               %{
+                 {:source, nil} => %{"srt" => %{"packets-received" => 10}},
+                 "total-bytes-received" => 21
+               },
+               baseline
+             )
+    end
   end
 
   @spec youtube_context() :: {map(), Endpoint.t()}

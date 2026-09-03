@@ -3,6 +3,7 @@ defmodule HydraSrtWeb.RouteController do
 
   alias HydraSrt.EndpointHealth
   alias HydraSrt.RouteAnalytics
+  alias HydraSrt.RouteControl
   alias HydraSrt.Routes
   alias HydraSrt.Tags
 
@@ -117,6 +118,52 @@ defmodule HydraSrtWeb.RouteController do
         conn
         |> put_status(:unprocessable_entity)
         |> json(%{error: inspect(reason)})
+    end
+  end
+
+  @spec reset_stats(Plug.Conn.t(), map()) :: Plug.Conn.t()
+  def reset_stats(conn, %{"route_id" => route_id}) do
+    case RouteControl.reset_route_stats(route_id) do
+      {:ok, reset_at} ->
+        data(conn, %{route_id: route_id, stats_reset_at: DateTime.to_iso8601(reset_at)})
+
+      {:error, :route_handler_unavailable} ->
+        conn
+        |> put_status(:conflict)
+        |> json(%{error: "Route is not running"})
+
+      {:error, :no_stats_yet} ->
+        conn
+        |> put_status(:conflict)
+        |> json(%{error: "No statistics received yet"})
+
+      {:error, _reason} ->
+        conn
+        |> put_status(:internal_server_error)
+        |> json(%{error: "Failed to reset route statistics"})
+    end
+  end
+
+  @spec clear_stats_reset(Plug.Conn.t(), map()) :: Plug.Conn.t()
+  def clear_stats_reset(conn, %{"route_id" => route_id}) do
+    case RouteControl.clear_route_stats_reset(route_id) do
+      {:ok, nil} ->
+        data(conn, %{route_id: route_id, stats_reset_at: nil})
+
+      {:error, :route_handler_unavailable} ->
+        conn
+        |> put_status(:conflict)
+        |> json(%{error: "Route is not running"})
+
+      {:error, :no_stats_yet} ->
+        conn
+        |> put_status(:conflict)
+        |> json(%{error: "No statistics received yet"})
+
+      {:error, _reason} ->
+        conn
+        |> put_status(:internal_server_error)
+        |> json(%{error: "Failed to reset route statistics"})
     end
   end
 

@@ -48,4 +48,15 @@ defmodule HydraSrt.RouteControlTest do
       assert updated["active_source_id"] == source["id"]
     end
   end
+
+  describe "route statistics reset" do
+    test "returns unavailable when no route handler is running" do
+      route = DbFixtures.route_fixture()
+
+      assert {:error, :route_handler_unavailable} = RouteControl.reset_route_stats(route["id"])
+
+      assert {:error, :route_handler_unavailable} =
+               RouteControl.clear_route_stats_reset(route["id"])
+    end
+  end
 end
