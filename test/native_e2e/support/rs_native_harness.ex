@@ -13,6 +13,9 @@ defmodule HydraSrt.E2E.Native.Harness do
   def latest_stats(pid), do: GenServer.call(pid, :latest_stats)
   def state(pid), do: GenServer.call(pid, :state)
 
+  @spec os_pid(pid()) :: non_neg_integer() | nil
+  def os_pid(pid), do: GenServer.call(pid, :os_pid)
+
   def await_stats(pid, fun, timeout_ms) when is_function(fun, 1) do
     start_ms = System.monotonic_time(:millisecond)
     do_await_stats(pid, start_ms, timeout_ms, fun)
@@ -84,6 +87,10 @@ defmodule HydraSrt.E2E.Native.Harness do
       Map.take(state, [:route_id, :latest_stats, :source_stream_id, :lines, :os_pid])
 
     {:reply, reply, state}
+  end
+
+  def handle_call(:os_pid, _from, state) do
+    {:reply, state.os_pid, state}
   end
 
   def handle_info({port, {:data, data}}, %{port: port} = state) when is_binary(data) do

@@ -204,6 +204,8 @@ defmodule HydraSrt.E2E.Native.Helpers do
         "kind" => "srt",
         "srt" =>
           %{"uri" => source_uri, "mode" => "caller"}
+          |> maybe_put("localaddress", Keyword.get(opts, :localaddress))
+          |> maybe_put("localport", Keyword.get(opts, :localport))
           |> maybe_put_passphrase(opts)
       },
       "destinations" => [

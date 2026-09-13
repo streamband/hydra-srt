@@ -121,7 +121,7 @@ defmodule HydraSrt.TestSupport.E2EHelpers do
   end
 
   def ensure_executables! do
-    for exe <- ["ffmpeg", "srt-live-transmit"] do
+    for exe <- ["ffmpeg", "srt-live-transmit", "lsof"] do
       case System.find_executable(exe) do
         nil -> raise ExUnit.AssertionError, message: "E2E requires #{exe} in PATH"
         _path -> :ok
@@ -129,6 +129,60 @@ defmodule HydraSrt.TestSupport.E2EHelpers do
     end
 
     :ok
+  end
+
+  @spec pipeline_udp_sockets!() :: [%{os_pid: integer(), address: String.t(), port: integer()}]
+  def pipeline_udp_sockets! do
+    case System.find_executable("lsof") do
+      nil -> raise "E2E pipeline UDP socket inspection requires lsof in PATH"
+      _path -> :ok
+    end
+
+    # Linux truncates the command name to 15 characters and lsof -c matches by
+    # prefix, so the short form finds the pipeline on both Linux and macOS.
+    # -w drops the stat warnings lsof prints on Linux CI runners, and stderr
+    # stays separate so nothing but the socket table reaches the parser.
+    {output, status} = System.cmd("lsof", ["-w", "-nP", "-iUDP", "-a", "-c", "hydra_srt_pipel"])
+
+    cond do
+      status == 1 and String.trim(output) == "" ->
+        []
+
+      status != 0 ->
+        raise "lsof UDP socket inspection failed with status #{status}: #{String.trim(output)}"
+
+      String.trim(output) == "" ->
+        []
+
+      true ->
+        [_header | lines] = String.split(output, "\n", trim: true)
+        Enum.map(lines, &parse_lsof_udp_line/1)
+    end
+  end
+
+  @spec parse_lsof_udp_line(String.t()) :: %{
+          os_pid: integer(),
+          address: String.t(),
+          port: integer()
+        }
+  def parse_lsof_udp_line(line) when is_binary(line) do
+    columns = String.split(String.trim(line))
+
+    case columns do
+      [_, pid | _] when length(columns) >= 9 ->
+        name = List.last(columns)
+
+        with {os_pid, ""} <- Integer.parse(pid),
+             [_, address, port_text] <- Regex.run(~r/\A(\*|\[[^\]]+\]|[^\s:]+):([0-9]+)\z/, name),
+             {port, ""} <- Integer.parse(port_text) do
+          %{os_pid: os_pid, address: address, port: port}
+        else
+          _ -> raise "Unable to parse lsof UDP line: #{inspect(line)}"
+        end
+
+      _ ->
+        raise "Unable to parse lsof UDP line: #{inspect(line)}"
+    end
   end
 
   def ensure_ffprobe_executable! do

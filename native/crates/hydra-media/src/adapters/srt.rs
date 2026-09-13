@@ -1,4 +1,4 @@
-use std::net::IpAddr;
+use std::net::{IpAddr, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -905,6 +905,7 @@ pub fn apply_source(element: &gst::Element, config: &SrtSource) -> Result<(), (E
     };
     apply_common(
         element,
+        config.mode(),
         config.uri().as_str(),
         config.latency().map(|v| v.get()),
         config.auto_reconnect(),
@@ -924,6 +925,7 @@ pub fn apply_destination(
 ) -> Result<(), (ErrorCode, String)> {
     apply_common(
         element,
+        config.mode(),
         config.uri().as_str(),
         config.latency().map(|v| v.get()),
         config.auto_reconnect(),
@@ -984,6 +986,7 @@ pub fn configure_sink(element: &gst::Element) {
 #[allow(clippy::too_many_arguments)]
 fn apply_common(
     element: &gst::Element,
+    mode: SrtMode,
     uri: &str,
     latency: Option<u64>,
     auto_reconnect: Option<bool>,
@@ -994,6 +997,13 @@ fn apply_common(
     localaddress: Option<&str>,
     localport: Option<u16>,
 ) -> Result<(), (ErrorCode, String)> {
+    // srtsrc and srtsink only bind a caller when both localaddress and localport
+    // are set, so a bare localaddress needs a concrete port to take effect.
+    let localport = match (mode, localaddress, localport) {
+        (SrtMode::Caller, Some(address), None) => Some(reserve_local_port(address)?),
+        (_, _, port) => port,
+    };
+
     set_property(element, "uri", uri)?;
     if let Some(latency) = latency {
         set_property(element, "latency", latency as u32)?;
@@ -1020,6 +1030,25 @@ fn apply_common(
         set_property(element, "localport", u32::from(localport))?;
     }
     Ok(())
+}
+
+fn reserve_local_port(localaddress: &str) -> Result<u16, (ErrorCode, String)> {
+    let fail = |detail: String| {
+        (
+            ErrorCode::ConfigInvalid,
+            format!("SRT caller cannot bind localaddress {localaddress}: {detail}"),
+        )
+    };
+    let socket_address = (localaddress, 0)
+        .to_socket_addrs()
+        .map_err(|error| fail(error.to_string()))?
+        .next()
+        .ok_or_else(|| fail("no address resolved".to_owned()))?;
+    let socket = UdpSocket::bind(socket_address).map_err(|error| fail(error.to_string()))?;
+    socket
+        .local_addr()
+        .map(|address| address.port())
+        .map_err(|error| fail(error.to_string()))
 }
 
 fn set_pbkeylen(element: &gst::Element, value: i32) -> Result<(), (ErrorCode, String)> {
@@ -1161,6 +1190,15 @@ mod tests {
     }
 
     fn source_config(mode: SrtMode, keep_listening: Option<bool>) -> SrtSource {
+        source_config_with_local_bind(mode, keep_listening, None, None)
+    }
+
+    fn source_config_with_local_bind(
+        mode: SrtMode,
+        keep_listening: Option<bool>,
+        localaddress: Option<HostAddress>,
+        localport: Option<Port>,
+    ) -> SrtSource {
         SrtSource::new(
             SrtUri::new("srt://127.0.0.1:4201").expect("valid SRT URI"),
             mode,
@@ -1171,11 +1209,32 @@ mod tests {
             None, // passphrase
             None, // pbkeylen
             None, // streamid
-            None, // localaddress
-            None, // localport
+            localaddress,
+            localport,
             None, // authentication
             None, // access
             None, // program_number
+        )
+    }
+
+    fn destination_config_with_local_bind(
+        mode: SrtMode,
+        localaddress: Option<HostAddress>,
+        localport: Option<Port>,
+    ) -> SrtDestination {
+        SrtDestination::new(
+            SrtUri::new("srt://127.0.0.1:4201").expect("valid SRT URI"),
+            mode,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            localaddress,
+            localport,
+            None,
         )
     }
 
@@ -1238,6 +1297,124 @@ mod tests {
                 .then(|| destination.property::<bool>("keep-listening")),
             destination_default
         );
+    }
+
+    #[test]
+    fn caller_source_with_localaddress_gets_a_bound_port() {
+        let _ = gst::init();
+        let element = gst::ElementFactory::make("srtsrc")
+            .build()
+            .expect("srtsrc element should be available for tests");
+        let config = source_config_with_local_bind(
+            SrtMode::Caller,
+            None,
+            Some(HostAddress::new("127.0.0.1").expect("valid host address")),
+            None,
+        );
+
+        apply_source(&element, &config).expect("caller source config applies");
+
+        assert!(element.property::<u32>("localport") > 0);
+        assert_eq!(element.property::<String>("localaddress"), "127.0.0.1");
+    }
+
+    #[test]
+    fn caller_source_with_explicit_localport_keeps_it() {
+        let _ = gst::init();
+        let element = gst::ElementFactory::make("srtsrc")
+            .build()
+            .expect("srtsrc element should be available for tests");
+        let config = source_config_with_local_bind(
+            SrtMode::Caller,
+            None,
+            Some(HostAddress::new("127.0.0.1").expect("valid host address")),
+            Some(Port::new(4321).expect("valid port")),
+        );
+
+        apply_source(&element, &config).expect("caller source config applies");
+
+        assert_eq!(element.property::<u32>("localport"), 4321);
+    }
+
+    #[test]
+    fn caller_source_without_localaddress_sets_no_localport() {
+        let _ = gst::init();
+        let element = gst::ElementFactory::make("srtsrc")
+            .build()
+            .expect("srtsrc element should be available for tests");
+        let default_element = gst::ElementFactory::make("srtsrc")
+            .build()
+            .expect("srtsrc element should be available for tests");
+        let default_localport = default_element.property::<u32>("localport");
+
+        apply_source(
+            &element,
+            &source_config_with_local_bind(SrtMode::Caller, None, None, None),
+        )
+        .expect("caller source config applies");
+
+        assert_eq!(element.property::<u32>("localport"), default_localport);
+    }
+
+    #[test]
+    fn listener_source_with_localaddress_only_is_untouched() {
+        let _ = gst::init();
+        let element = gst::ElementFactory::make("srtsrc")
+            .build()
+            .expect("srtsrc element should be available for tests");
+        let default_element = gst::ElementFactory::make("srtsrc")
+            .build()
+            .expect("srtsrc element should be available for tests");
+        let default_localport = default_element.property::<u32>("localport");
+        let config = source_config_with_local_bind(
+            SrtMode::Listener,
+            None,
+            Some(HostAddress::new("127.0.0.1").expect("valid host address")),
+            None,
+        );
+
+        apply_source(&element, &config).expect("listener source config applies");
+
+        assert_eq!(element.property::<u32>("localport"), default_localport);
+    }
+
+    #[test]
+    fn caller_destination_with_localaddress_gets_a_bound_port() {
+        let _ = gst::init();
+        let element = gst::ElementFactory::make("srtsink")
+            .build()
+            .expect("srtsink element should be available for tests");
+        let config = destination_config_with_local_bind(
+            SrtMode::Caller,
+            Some(HostAddress::new("127.0.0.1").expect("valid host address")),
+            None,
+        );
+
+        apply_destination(&element, &config).expect("caller destination config applies");
+
+        assert!(element.property::<u32>("localport") > 0);
+        assert_eq!(element.property::<String>("localaddress"), "127.0.0.1");
+    }
+
+    #[test]
+    fn caller_source_with_unusable_localaddress_fails() {
+        let _ = gst::init();
+        let element = gst::ElementFactory::make("srtsrc")
+            .build()
+            .expect("srtsrc element should be available for tests");
+        // 203.0.113.1 is a valid unassigned address that fails to bind on macOS and standard Linux CI.
+        let config = source_config_with_local_bind(
+            SrtMode::Caller,
+            None,
+            Some(HostAddress::new("203.0.113.1").expect("valid host address")),
+            None,
+        );
+
+        let (code, detail) =
+            apply_source(&element, &config).expect_err("unusable local address must fail");
+
+        assert_eq!(code, ErrorCode::ConfigInvalid);
+        assert!(detail.contains("203.0.113.1"), "detail was: {detail}");
     }
 
     #[test]
