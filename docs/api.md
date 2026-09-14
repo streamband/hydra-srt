@@ -120,6 +120,81 @@ The token is obtained by logging in and should be sent in the `Authorization` he
 *   **Stop Route:** `GET /api/routes/:route_id/stop`
 *   **Restart Route:** `GET /api/routes/:route_id/restart`
 
+### Route Statistics Reset
+
+Operators can set a display baseline for accumulating SRT and byte counters on a running route. A reset does **not** clear the underlying SRT socket counters. GStreamer exposes no API to zero those counters, so HydraSRT records a baseline snapshot and subtracts it for display only. Raw counters and all data written to VictoriaMetrics stay monotonic and unchanged.
+
+When a baseline is active, the live stats snapshot (WebSocket, `metric: "snapshot"`) includes a top-level `since_reset` object:
+
+```json
+{
+  "since_reset": {
+    "reset_at": "2026-09-03T10:00:00.000000Z",
+    "rebased_at": null,
+    "source": {
+      "bytes_in_total": 12345,
+      "srt": { "packets-received": 900, "packets-received-lost": 3 }
+    },
+    "destinations": [
+      {
+        "id": "dest-uuid",
+        "bytes_out_total": 999,
+        "drops": 0,
+        "srt": { "packets-sent": 900, "packets-sent-lost": 1 }
+      }
+    ]
+  }
+}
+```
+
+Only monotonic counter fields appear in `since_reset`. Rates, percentages, RTT, and negotiated latency are not included. A field missing from either the baseline or the current tick is omitted (not zero).
+
+When the SRT connection restarts, socket counters reset to zero. If any differenced field in the current tick is lower than its baseline value, the route baseline is re-taken from the current tick and `rebased_at` is set to that moment. `reset_at` keeps the operator's original reset time. Reported figures then cover only the time since `rebased_at`.
+
+When no baseline is set, the `since_reset` key is absent from the snapshot.
+
+#### Set Statistics Reset Baseline
+
+*   **Endpoint:** `POST /api/routes/:route_id/stats/reset`
+*   **Description:** Captures the most recent stats tick as the display baseline.
+*   **Response:** `200 OK`
+    ```json
+    {
+      "data": {
+        "route_id": "route_id",
+        "stats_reset_at": "2026-09-03T10:00:00.000000Z"
+      }
+    }
+    ```
+*   **Errors:**
+    *   `409 Conflict` when the route has no live handler:
+        ```json
+        { "error": "Route is not running" }
+        ```
+    *   `409 Conflict` when the handler is running but no statistics tick has arrived yet:
+        ```json
+        { "error": "No statistics received yet" }
+        ```
+
+#### Clear Statistics Reset Baseline
+
+*   **Endpoint:** `DELETE /api/routes/:route_id/stats/reset`
+*   **Description:** Discards the display baseline. Stored history and raw counters are unchanged.
+*   **Response:** `200 OK`
+    ```json
+    {
+      "data": {
+        "route_id": "route_id",
+        "stats_reset_at": null
+      }
+    }
+    ```
+*   **Errors:**
+    *   `409 Conflict` when the route has no live handler:
+        ```json
+        { "error": "Route is not running" }
+        ```
+
 ### Route Runtime Statuses
 
 Route runtime status is exposed in route payloads via `schema_status` (fallback: `status`).
