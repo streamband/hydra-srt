@@ -496,8 +496,8 @@ const Settings = () => {
     }
   };
 
-  // Backup tab content
-  const BackupTabContent = () => {
+  // Render helpers, not inline components, so the uptime tick does not remount the tab DOM.
+  const renderBackupTab = () => {
     return (
       <div>
         <Card title="System Backup" style={{ marginBottom: '16px' }}>
@@ -544,8 +544,7 @@ const Settings = () => {
     );
   };
 
-  // Routes tab content
-  const RoutesTabContent = () => {
+  const renderRoutesTab = () => {
     return (
       <div>
         <Card title="Routes Backup">
@@ -583,7 +582,7 @@ const Settings = () => {
     );
   };
 
-  const RouteTagsTabContent = () => {
+  const renderRouteTagsTab = () => {
     const columns = [
       {
         title: 'Name',
@@ -636,7 +635,7 @@ const Settings = () => {
     );
   };
 
-  const NotificationsTabContent = () => {
+  const renderNotificationsTab = () => {
     const handleSave = async () => {
       try {
         const values: any = await notificationsForm.validateFields();
@@ -758,7 +757,7 @@ const Settings = () => {
     );
   };
 
-  const SignalGenerationTabContent = () => {
+  const renderSignalGenerationTab = () => {
     const handleSave = async () => {
       try {
         const values: any = await signalForm.validateFields();
@@ -938,7 +937,7 @@ const Settings = () => {
     {
       key: 'route-tags',
       label: 'Route tags',
-      children: <RouteTagsTabContent />,
+      children: renderRouteTagsTab(),
     },
     {
       key: 'tokens',
@@ -948,23 +947,23 @@ const Settings = () => {
     {
       key: 'notifications',
       label: 'Notifications',
-      children: <NotificationsTabContent />,
+      children: renderNotificationsTab(),
     },
     {
       key: 'backup',
       label: 'Backup',
-      children: <BackupTabContent />,
+      children: renderBackupTab(),
     },
     {
       key: 'routes',
       label: 'Routes',
-      children: <RoutesTabContent />,
+      children: renderRoutesTab(),
     },
     ...(initData.demo_data
       ? [{
           key: 'signal-generation',
           label: 'Signal generation',
-          children: <SignalGenerationTabContent />,
+          children: renderSignalGenerationTab(),
         }]
       : []),
   ];

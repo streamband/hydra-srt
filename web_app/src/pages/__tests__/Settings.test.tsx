@@ -1,6 +1,6 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import Settings from '../Settings';
 
 const { importRoutes, reloadPage } = vi.hoisted(() => ({
@@ -60,5 +60,70 @@ describe('Settings route backup', () => {
       expect(importRoutes).toHaveBeenCalledWith(file);
       expect(reloadPage).toHaveBeenCalledOnce();
     });
+  });
+});
+
+describe('Settings file inputs across uptime ticks', () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    vi.clearAllMocks();
+    importRoutes.mockResolvedValue({ routes_created: 2 });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('keeps the routes backup file input mounted across uptime ticks', async () => {
+    const { container } = render(
+      <MemoryRouter initialEntries={['/settings/routes']}>
+        <Settings />
+      </MemoryRouter>,
+    );
+
+    const input = container.querySelector<HTMLInputElement>('input[name="routes-backup"]');
+    expect(input).not.toBeNull();
+
+    await act(async () => {
+      vi.advanceTimersByTime(3000);
+    });
+
+    expect(container.querySelector('input[name="routes-backup"]')).toBe(input);
+    expect(input!.isConnected).toBe(true);
+
+    const file = new File(['{"backup_version":"1.0","routes":[]}'], 'routes.json', {
+      type: 'application/json',
+    });
+    fireEvent.change(input!, { target: { files: [file] } });
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Import routes' }));
+
+    await waitFor(() => {
+      expect(importRoutes).toHaveBeenCalledWith(file);
+    });
+  });
+
+  it('keeps the database restore file input mounted across uptime ticks', async () => {
+    const { container } = render(
+      <MemoryRouter initialEntries={['/settings/backup']}>
+        <Settings />
+      </MemoryRouter>,
+    );
+
+    const input = container.querySelector<HTMLInputElement>('input[name="backup"]');
+    expect(input).not.toBeNull();
+
+    await act(async () => {
+      vi.advanceTimersByTime(3000);
+    });
+
+    expect(container.querySelector('input[name="backup"]')).toBe(input);
+    expect(input!.isConnected).toBe(true);
+
+    const file = new File(['sqlite'], 'backup.db', { type: 'application/octet-stream' });
+    fireEvent.change(input!, { target: { files: [file] } });
+
+    expect(await screen.findByText('Confirm Restore')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Yes, Restore' })).toBeInTheDocument();
   });
 });
