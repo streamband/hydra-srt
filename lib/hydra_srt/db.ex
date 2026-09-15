@@ -8,12 +8,144 @@ defmodule HydraSrt.Db do
   alias HydraSrt.Api.Notification
   alias HydraSrt.Api.Route
   alias HydraSrt.Api.Tag
+  alias HydraSrt.Api.TelemetryInstallation
   alias HydraSrt.Api.Token
   alias HydraSrt.Auth
   alias HydraSrt.Repo
   alias HydraSrt.Stats.EventLogger
 
   @status_stopped "stopped"
+
+  @telemetry_transport_names [:srt, :udp, :rtp, :rtmp, :ndi, :youtube]
+
+  @spec get_telemetry_installation() :: %TelemetryInstallation{} | nil
+  def get_telemetry_installation do
+    Repo.get(TelemetryInstallation, 1)
+  end
+
+  @spec upsert_telemetry_installation(map()) ::
+          {:ok, %TelemetryInstallation{}} | {:error, Ecto.Changeset.t()}
+  def upsert_telemetry_installation(attrs) when is_map(attrs) do
+    row = get_telemetry_installation() || %TelemetryInstallation{id: 1}
+
+    attrs
+    |> Map.put_new(:id, 1)
+    |> then(&TelemetryInstallation.changeset(row, &1))
+    |> Repo.insert_or_update()
+  end
+
+  @spec ensure_telemetry_installation_id(boolean()) :: {:ok, String.t()} | {:error, term()}
+  def ensure_telemetry_installation_id(enabled?) when is_boolean(enabled?) do
+    if enabled? do
+      row = get_telemetry_installation() || %TelemetryInstallation{id: 1}
+
+      case row.installation_id do
+        id when is_binary(id) and id != "" ->
+          {:ok, id}
+
+        _ ->
+          id = Ecto.UUID.generate()
+
+          case upsert_telemetry_installation(%{installation_id: id}) do
+            {:ok, _row} -> {:ok, id}
+            {:error, reason} -> {:error, reason}
+          end
+      end
+    else
+      {:error, :disabled}
+    end
+  end
+
+  @spec mark_telemetry_heartbeat(DateTime.t(), String.t()) :: :ok | {:error, term()}
+  def mark_telemetry_heartbeat(timestamp, version) do
+    case upsert_telemetry_installation(%{
+           last_heartbeat_at: timestamp,
+           last_seen_version: version
+         }) do
+      {:ok, _row} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @spec mark_telemetry_version(String.t()) :: :ok | {:error, term()}
+  def mark_telemetry_version(version) when is_binary(version) do
+    case upsert_telemetry_installation(%{last_seen_version: version}) do
+      {:ok, _row} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @spec telemetry_route_snapshot() :: map()
+  def telemetry_route_snapshot do
+    routes = Repo.all(Route)
+    endpoints = Repo.all(Endpoint)
+    enabled_endpoints = Enum.filter(endpoints, &(&1.enabled == true))
+    sources = Enum.filter(enabled_endpoints, &(&1.type == Endpoint.source_type()))
+    destinations = Enum.filter(enabled_endpoints, &(&1.type == Endpoint.destination_type()))
+
+    source_counts = telemetry_transport_counts(sources)
+    destination_counts = telemetry_transport_counts(destinations)
+
+    failover_count =
+      routes
+      |> Enum.count(fn route ->
+        source_count = Enum.count(sources, &(&1.route_id == route.id))
+        source_count >= 2 and route.backup_mode in ["active", "passive"]
+      end)
+
+    notification = get_notification_by_type(Notification.telegram_type())
+    telegram_enabled = telegram_notification_enabled?(notification)
+    status_values = Enum.map(routes, &(&1.schema_status || &1.status))
+
+    %{
+      route_count_total: length(routes),
+      routes_active_count: Enum.count(status_values, &HydraSrt.live_route_status?/1),
+      route_counts_by_source_transport: source_counts,
+      route_counts_by_destination_transport: destination_counts,
+      failover_configured_count: failover_count,
+      interfaces_count: Repo.aggregate(Interface, :count, :id),
+      mcp_enabled: true,
+      ndi_enabled: HydraSrt.Ndi.FeaturePolicy.enabled?(),
+      youtube_enabled: Application.get_env(:hydra_srt, :youtube, [])[:enabled] == true,
+      telegram_enabled: telegram_enabled,
+      victoria_configured: victoria_configured?()
+    }
+  end
+
+  @spec telemetry_transport_counts(list(%Endpoint{})) :: map()
+  def telemetry_transport_counts(endpoints) do
+    counts = Map.new(@telemetry_transport_names, &{&1, 0})
+
+    Enum.reduce(endpoints, counts, fn endpoint, acc ->
+      key = String.downcase(to_string(endpoint.schema))
+
+      case Enum.find(@telemetry_transport_names, &(Atom.to_string(&1) == key)) do
+        nil -> acc
+        transport -> Map.update!(acc, transport, &(&1 + 1))
+      end
+    end)
+  end
+
+  @spec telegram_notification_enabled?(%Notification{} | nil) :: boolean()
+  def telegram_notification_enabled?(%Notification{enabled: true, config: config})
+      when is_map(config) do
+    is_binary(notification_param(config, "bot_token", "")) and
+      notification_param(config, "bot_token", "") != "" and
+      is_binary(notification_param(config, "chat_id", "")) and
+      notification_param(config, "chat_id", "") != ""
+  end
+
+  def telegram_notification_enabled?(_notification), do: false
+
+  @spec victoria_configured?() :: boolean()
+  def victoria_configured? do
+    Enum.any?(["VICTORIA_METRICS_URL", "VICTORIA_LOGS_URL"], fn key ->
+      case System.get_env(key) do
+        value when is_binary(value) -> String.trim(value) != ""
+        _ -> false
+      end
+    end)
+  end
 
   @spec create_route(map, binary | nil) :: {:ok, map} | {:error, any}
   def create_route(data, id \\ nil) when is_map(data) do

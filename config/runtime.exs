@@ -28,6 +28,48 @@ end
 config :hydra_srt, demo_data: Env.get_boolean("DEMO_DATA", false)
 config :hydra_srt, rtmp_port: Env.get_integer("RTMP_PORT", 1935)
 
+telemetry_config = Application.get_env(:hydra_srt, :telemetry, [])
+
+config :hydra_srt,
+       :telemetry,
+       Keyword.merge(telemetry_config,
+         sentry_dsn: HydraSrt.Telemetry.Config.sentry_dsn(),
+         posthog_key: HydraSrt.Telemetry.Config.default_posthog_key(),
+         posthog_host: HydraSrt.Telemetry.Config.default_posthog_host(),
+         first_heartbeat_delay_ms: :timer.minutes(5),
+         heartbeat_interval_ms: :timer.hours(24),
+         heartbeat_jitter_ms: :timer.minutes(15),
+         queue_max_events: 100,
+         queue_max_bytes: 1_048_576,
+         crash_max_events_per_fingerprint_hour: 3,
+         connect_timeout_ms: :timer.seconds(2),
+         request_timeout_ms: :timer.seconds(5),
+         shutdown_deadline_ms: :timer.seconds(3)
+       )
+
+config :hydra_srt,
+  telemetry_http_request: &HydraSrt.Telemetry.Http.default_request/5
+
+config :sentry,
+  dsn: HydraSrt.Telemetry.Config.sentry_dsn(),
+  environment_name: to_string(config_env()),
+  release: HydraSrt.Telemetry.Config.version(),
+  send_default_pii: false,
+  before_send: {HydraSrt.Telemetry.Crash, :before_send},
+  in_app_module_allow_list: [HydraSrt, HydraSrtWeb],
+  enable_source_code_context: false,
+  dedup_events: true,
+  send_result: :none,
+  sample_rate: 1.0,
+  send_client_reports: false,
+  report_deps: false,
+  enable_logs: false,
+  enable_metrics: false,
+  traces_sample_rate: nil,
+  max_breadcrumbs: 0,
+  tags: %{component: "beam"},
+  client: HydraSrt.Telemetry.SentryClient
+
 # NDI stays off unless NDI_FEATURE is set. Parsed to booleans here so
 # HydraSrt.Ndi.FeaturePolicy only ever reads already-typed flags.
 ndi_feature? = Env.get_boolean("NDI_FEATURE", false)

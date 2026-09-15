@@ -445,7 +445,7 @@ fn hls_dynamic_parsed_pad_links_through_the_pacer() {
 
     assert!(source_pad.is_linked());
     let pacer = bin.by_name("hls_pacer_hls_parsebin_src");
-    assert_eq!(pacer.expect("HLS pacer").property::<bool>("sync"), true);
+    assert!(pacer.expect("HLS pacer").property::<bool>("sync"));
     assert_eq!(
         bin.by_name("hls_queue_hls_parsebin_src")
             .expect("HLS pacing queue")

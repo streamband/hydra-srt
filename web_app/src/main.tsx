@@ -21,6 +21,7 @@ import { isAuthenticated } from './utils/auth';
 import { ROUTES } from './utils/constants';
 import { connectRealtime, disconnectRealtime } from './utils/realtime';
 import { InitProvider } from './context/InitContext';
+import { TelemetryErrorBoundary } from './components/TelemetryErrorBoundary';
 import './index.css';
 
 const config = {
@@ -99,6 +100,13 @@ const RealtimeConnection = () => {
 const App = () => {
   const [isLoading, setIsLoading] = useState(true);
   const noop = () => {};
+
+  if (
+    import.meta.env.MODE === 'test' &&
+    new URLSearchParams(window.location.search).get('hydra_test_error') === '1'
+  ) {
+    throw new Error('HydraSRT test render failure');
+  }
 
   useEffect(() => {
     // Check if user is authenticated
@@ -238,9 +246,11 @@ if (!rootEl) {
 ReactDOM.createRoot(rootEl).render(
   <StrictMode>
     <InitProvider>
-      <ConfigProvider theme={config}>
-        <App />
-      </ConfigProvider>
+      <TelemetryErrorBoundary>
+        <ConfigProvider theme={config}>
+          <App />
+        </ConfigProvider>
+      </TelemetryErrorBoundary>
     </InitProvider>
   </StrictMode>,
 );

@@ -9,6 +9,7 @@ defmodule HydraSrtWeb.Router do
 
   pipeline :api do
     plug :accepts, ["json"]
+    plug HydraSrtWeb.Plugs.TelemetryRequestContext
   end
 
   pipeline :auth do
@@ -36,6 +37,7 @@ defmodule HydraSrtWeb.Router do
 
   scope "/api", HydraSrtWeb do
     pipe_through [:api, :auth]
+    post "/telemetry/envelope", TelemetryEnvelopeController, :create
     get "/dashboard", DashboardController, :show
     post "/routes/test-source", RouteController, :test_source
     get "/tags", RouteController, :list_tags
@@ -129,14 +131,14 @@ defmodule HydraSrtWeb.Router do
           conn
         else
           conn
-          |> put_status(403)
+          |> put_status(if(conn.request_path == "/api/telemetry/envelope", do: 401, else: 403))
           |> Phoenix.Controller.json(%{error: "Unauthorized"})
           |> halt()
         end
 
       _ ->
         conn
-        |> put_status(403)
+        |> put_status(if(conn.request_path == "/api/telemetry/envelope", do: 401, else: 403))
         |> Phoenix.Controller.json(%{error: "Authorization header missing"})
         |> halt()
     end

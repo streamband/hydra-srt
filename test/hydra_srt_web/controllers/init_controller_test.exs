@@ -1,5 +1,5 @@
 defmodule HydraSrtWeb.InitControllerTest do
-  use HydraSrtWeb.ConnCase, async: true
+  use HydraSrtWeb.ConnCase, async: false
 
   test "show returns init payload with version", %{conn: conn} do
     conn = get(conn, ~p"/api/init")
@@ -19,5 +19,7 @@ defmodule HydraSrtWeb.InitControllerTest do
     assert is_binary(payload["rust_version"])
     assert payload["rust_version"] != ""
     assert payload["demo_data"] in [true, false]
+
+    assert payload["sentry_dsn"] == nil
   end
 end
