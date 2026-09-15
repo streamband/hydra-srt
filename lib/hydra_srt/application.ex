@@ -66,6 +66,7 @@ defmodule HydraSrt.Application do
       {HydraSrt.Mcp.Server, transport: {:streamable_http, start: true}, request_timeout: 20_000},
       {HydraSrt.Stats.PipelineLogger, pipeline_logger_opts()},
       {HydraSrt.Notifications.Telegram, %{}},
+      HydraSrt.Telemetry,
       rtmp_server_listener,
       HydraSrtWeb.Endpoint
     ]
