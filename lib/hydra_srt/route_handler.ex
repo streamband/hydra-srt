@@ -32,6 +32,17 @@ defmodule HydraSrt.RouteHandler do
   # waiting between attempts. This is the one place the reset happens; see
   # `note_healthy_tick/1`.
   @retry_budget_reset_after_healthy_ms @retry_ceiling_ms
+  @native_crash_exit_grace_ms 500
+  @native_crash_report_interval_ms :timer.minutes(10)
+  @native_url_pattern Regex.compile!("(?i)(?:https?|srt|rtmp|udp|rtp|hls)://[^[:space:]'<>]+")
+  @native_secret_pattern Regex.compile!(
+                           "(?i)(passphrase|streamid|stream-key|token|access_token|authorization|bearer)=([^&[:space:],;]+)"
+                         )
+  @native_ipv4_pattern Regex.compile!("(?:\\d{1,3}\\.){3}\\d{1,3}(?::\\d+)?")
+  @native_ipv6_pattern Regex.compile!("\\[?[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){2,7}\\]?")
+  @native_path_pattern Regex.compile!(
+                         "(?:[A-Za-z]:[\\\\/]|/(?:Users|home|tmp|app|private|var)/)[^[:space:]'<>]+"
+                       )
 
   alias HydraSrt.Api.Endpoint
   alias HydraSrt.Db
@@ -40,6 +51,8 @@ defmodule HydraSrt.RouteHandler do
   alias HydraSrt.Ndi.FeaturePolicy
   alias HydraSrt.Stats.EventLogger
   alias HydraSrt.SystemInterfaces
+  alias HydraSrt.Telemetry.Crash
+  alias HydraSrt.Telemetry.Settings
   alias HydraSrt.Youtube
   alias HydraSrt.Youtube.Cache, as: YoutubeCache
   alias HydraSrt.Youtube.FeaturePolicy, as: YoutubeFeaturePolicy
@@ -82,6 +95,10 @@ defmodule HydraSrt.RouteHandler do
           required(:process_instance_id) => String.t() | nil,
           required(:endpoint_health) => %{optional(String.t()) => endpoint_health_payload()},
           required(:route_terminal) => route_terminal_t() | nil,
+          required(:last_native_crash_at) => integer() | nil,
+          required(:last_native_unparsed_line) => String.t() | nil,
+          required(:last_native_line_at) => integer() | nil,
+          required(:last_crash_report_at) => integer() | nil,
           required(:source_loss_since_ms) => integer() | nil,
           required(:source_loss_signal) => source_loss_signal() | nil,
           required(:source_data_seen?) => boolean(),
@@ -113,6 +130,7 @@ defmodule HydraSrt.RouteHandler do
           | {:endpoint_health, endpoint_health_payload()}
           | {:media_info, json_map()}
           | {:route_terminal, route_terminal_payload()}
+          | {:crash, json_map()}
           | {:stats, json_map()}
           | :unknown
 
@@ -215,6 +233,10 @@ defmodule HydraSrt.RouteHandler do
       process_instance_id: nil,
       endpoint_health: %{},
       route_terminal: nil,
+      last_native_crash_at: nil,
+      last_native_unparsed_line: nil,
+      last_native_line_at: nil,
+      last_crash_report_at: nil,
       # Soft source-loss window (merged triggers B+C): one debounce clock.
       source_loss_since_ms: nil,
       source_loss_signal: nil,
@@ -372,7 +394,9 @@ defmodule HydraSrt.RouteHandler do
     log_fun = if status == 0, do: &Logger.info/1, else: &Logger.error/1
     log_fun.("RouteHandler: native pipeline exited with status #{status}")
 
-    next_data = maybe_schedule_hard_retry_after_process_loss(%{data | port: nil})
+    next_data = %{data | port: nil}
+    next_data = maybe_report_native_exit(next_data, status)
+    next_data = maybe_schedule_hard_retry_after_process_loss(next_data)
     {:keep_state, next_data}
   end
 
@@ -1005,17 +1029,21 @@ defmodule HydraSrt.RouteHandler do
       {:route_terminal, payload} ->
         apply_route_terminal_event(data, payload)
 
+      {:crash, payload} ->
+        apply_native_crash_event(data, payload)
+
       :unknown ->
-        Logger.warning("RouteHandler: unknown native json line: #{inspect(json)}")
-        data
+        Logger.warning("RouteHandler: unknown native json line")
+        remember_native_line(data, json)
     end
   end
 
   def process_port_line(line, data) do
+    data = remember_native_line(data, line)
     {:message_queue_len, len} = Process.info(self(), :message_queue_len)
 
     if len < 500 do
-      Logger.debug("RouteHandler: pipeline: #{inspect(line)}")
+      Logger.debug("RouteHandler: pipeline: #{inspect(data[:last_native_unparsed_line])}")
 
       case HydraSrt.Stats.PipelineLogParser.parse(line) do
         {:ok, log} ->
@@ -1033,6 +1061,399 @@ defmodule HydraSrt.RouteHandler do
     end
 
     data
+  end
+
+  @doc false
+  @spec apply_native_crash_event(data_t(), json_map()) :: data_t()
+  def apply_native_crash_event(data, payload) when is_map(data) and is_map(payload) do
+    cond do
+      not matching_process_event?(data, payload) ->
+        data
+
+      not valid_native_crash_payload?(payload) ->
+        data
+
+      not crash_reporting_enabled?() ->
+        data
+
+      true ->
+        now = now_ms()
+        native_payload = native_crash_payload(data, payload)
+
+        if crash_report_admitted?(data, now) do
+          safe_report_native(native_payload, native_crash_metadata(data.route))
+
+          data
+          |> Map.put(:last_native_crash_at, now)
+          |> Map.put(:last_crash_report_at, now)
+        else
+          Map.put(data, :last_native_crash_at, now)
+        end
+    end
+  end
+
+  @spec valid_native_crash_payload?(json_map()) :: boolean()
+  def valid_native_crash_payload?(payload) when is_map(payload) do
+    Map.keys(payload) |> Enum.all?(&(&1 in native_crash_keys())) and
+      payload["event"] == "crash" and
+      bounded_binary?(payload["route_id"], 128) and
+      bounded_binary?(payload["config_revision"], 128) and
+      bounded_binary?(payload["process_instance_id"], 128) and
+      payload["kind"] in ["panic", "fatal", "gst_error"] and
+      bounded_binary?(payload["error_class"], 96) and
+      bounded_binary?(payload["message"], 512) and
+      valid_native_frames?(payload["frames"]) and
+      bounded_binary?(payload["thread"], 64) and
+      valid_optional_binary?(payload["gst_element"], 96) and
+      payload["pipeline_state"] in [
+        "starting",
+        "playing",
+        "paused",
+        "stopping",
+        "stopped",
+        "failed",
+        "unknown"
+      ] and
+      valid_native_transport?(payload["route_source_transport"]) and
+      valid_native_destination_transports?(payload["route_destination_transports"]) and
+      bounded_binary?(payload["version"], 32) and
+      is_integer(payload["ts"]) and payload["ts"] >= 0
+  end
+
+  def valid_native_crash_payload?(_payload), do: false
+
+  @spec native_crash_keys() :: [String.t()]
+  def native_crash_keys do
+    [
+      "event",
+      "route_id",
+      "config_revision",
+      "process_instance_id",
+      "kind",
+      "error_class",
+      "message",
+      "frames",
+      "thread",
+      "gst_element",
+      "pipeline_state",
+      "route_source_transport",
+      "route_destination_transports",
+      "version",
+      "ts"
+    ]
+  end
+
+  @spec valid_native_frames?(term()) :: boolean()
+  def valid_native_frames?(frames) when is_list(frames) and length(frames) <= 30,
+    do: Enum.all?(frames, &valid_native_frame?/1)
+
+  def valid_native_frames?(_frames), do: false
+
+  @spec valid_native_frame?(term()) :: boolean()
+  def valid_native_frame?(frame) when is_map(frame) do
+    Map.keys(frame) |> Enum.all?(&(&1 in ["module", "function", "file", "line"])) and
+      bounded_binary?(frame["module"], 160) and
+      bounded_binary?(frame["function"], 160) and
+      valid_optional_binary?(frame["file"], 160) and
+      valid_optional_line?(frame["line"])
+  end
+
+  def valid_native_frame?(_frame), do: false
+
+  @spec valid_optional_line?(term()) :: boolean()
+  def valid_optional_line?(nil), do: true
+  def valid_optional_line?(line), do: is_integer(line) and line >= 0 and line <= 10_000_000
+
+  @spec bounded_binary?(term(), pos_integer()) :: boolean()
+  def bounded_binary?(value, max_bytes), do: is_binary(value) and byte_size(value) <= max_bytes
+
+  @spec valid_optional_binary?(term(), pos_integer()) :: boolean()
+  def valid_optional_binary?(nil, _max_bytes), do: true
+  def valid_optional_binary?(value, max_bytes), do: bounded_binary?(value, max_bytes)
+
+  @spec valid_native_transport?(term()) :: boolean()
+  def valid_native_transport?(value),
+    do: value in ["srt", "udp", "rtmp", "rtp", "ndi", "youtube", "hls", "unknown"]
+
+  @spec valid_native_destination_transports?(term()) :: boolean()
+  def valid_native_destination_transports?(transports)
+      when is_list(transports) and length(transports) <= 8 do
+    Enum.uniq(transports) == transports and Enum.all?(transports, &valid_native_transport?/1)
+  end
+
+  def valid_native_destination_transports?(_transports), do: false
+
+  @spec native_crash_payload(data_t(), json_map()) :: map()
+  def native_crash_payload(data, payload) do
+    %{
+      component: :rust_pipeline,
+      kind: native_crash_kind(payload["kind"]),
+      exit_status: nil,
+      error_class: sanitize_native_text(payload["error_class"], 96, data),
+      message: sanitize_native_text(payload["message"], 512, data),
+      frames: Enum.map(payload["frames"], &native_crash_frame(&1, data)),
+      gst_element: normalize_native_gst_element(payload["gst_element"], data),
+      source_transport: route_source_transport(data.route),
+      destination_transports: route_destination_transports(data.route)
+    }
+  end
+
+  @spec native_crash_kind(String.t()) :: :panic | :fatal
+  def native_crash_kind("panic"), do: :panic
+  def native_crash_kind(_kind), do: :fatal
+
+  @spec native_crash_frame(json_map(), data_t()) :: map()
+  def native_crash_frame(frame, data) do
+    crate = sanitize_native_text(frame["module"], 160, data)
+
+    if String.starts_with?(crate, "hydra_") or crate == "hydra" do
+      Crash.native_frame(
+        crate,
+        sanitize_native_text(frame["function"], 160, data),
+        sanitize_optional_native_text(relative_native_file(frame["file"]), 160, data),
+        frame["line"]
+      )
+    else
+      Crash.native_frame(crate, "", nil, nil)
+    end
+  end
+
+  @spec relative_native_file(String.t() | nil) :: String.t() | nil
+  def relative_native_file(nil), do: nil
+
+  def relative_native_file(file) when is_binary(file) do
+    case String.split(file, "native/", parts: 2) do
+      [_absolute, relative] -> "native/" <> relative
+      _ -> file
+    end
+  end
+
+  @spec sanitize_optional_native_text(term(), pos_integer(), data_t()) :: String.t() | nil
+  def sanitize_optional_native_text(nil, _max_bytes, _data), do: nil
+
+  def sanitize_optional_native_text(value, max_bytes, data) when is_binary(value),
+    do: sanitize_native_text(value, max_bytes, data)
+
+  @spec normalize_native_gst_element(term(), data_t()) :: String.t() | nil
+  def normalize_native_gst_element(nil, _data), do: nil
+
+  def normalize_native_gst_element(value, data) when is_binary(value) do
+    value = sanitize_native_text(value, 96, data)
+
+    if Regex.match?(~r/\A[a-zA-Z0-9_.-]{1,96}\z/, value), do: value, else: nil
+  end
+
+  @spec sanitize_native_text(String.t(), pos_integer(), data_t()) :: String.t()
+  def sanitize_native_text(value, max_bytes, data) when is_binary(value) do
+    value
+    |> LogSanitizer.sanitize_payload()
+    |> then(&Regex.replace(@native_url_pattern, &1, "[URL]"))
+    |> then(
+      &Regex.replace(@native_secret_pattern, &1, fn _, key, _secret ->
+        key <> "=[REDACTED]"
+      end)
+    )
+    |> then(&Regex.replace(@native_ipv4_pattern, &1, "[IP]"))
+    |> then(&Regex.replace(@native_ipv6_pattern, &1, "[IP]"))
+    |> then(&Regex.replace(@native_path_pattern, &1, "[PATH]"))
+    |> scrub_route_identifiers(data)
+    |> truncate_bytes(max_bytes)
+  end
+
+  @spec scrub_route_identifiers(String.t(), data_t()) :: String.t()
+  def scrub_route_identifiers(value, data) do
+    [data[:id], data[:process_instance_id] | route_identifier_values(data[:route] || %{})]
+    |> Enum.filter(&(is_binary(&1) and &1 != ""))
+    |> Enum.reduce(value, &String.replace(&2, &1, "[REDACTED]"))
+  end
+
+  @spec route_identifier_values(term()) :: [String.t()]
+  def route_identifier_values(route) when is_map(route) do
+    Enum.flat_map(route, fn
+      {key, value}
+      when key in ["name", "route_name", "id", "endpoint_id", "source_id"] and
+             is_binary(value) ->
+        [value]
+
+      {_key, value} when is_map(value) ->
+        route_identifier_values(value)
+
+      {_key, value} when is_list(value) ->
+        Enum.flat_map(value, &route_identifier_values/1)
+
+      _ ->
+        []
+    end)
+  end
+
+  def route_identifier_values(_route), do: []
+
+  @spec truncate_bytes(String.t(), pos_integer()) :: String.t()
+  def truncate_bytes(value, max_bytes) do
+    if byte_size(value) <= max_bytes do
+      value
+    else
+      prefix = binary_part(value, 0, max_bytes)
+
+      if String.valid?(prefix) do
+        prefix
+      else
+        truncate_bytes(binary_part(value, 0, max_bytes - 1), max_bytes - 1)
+      end
+    end
+  end
+
+  @spec maybe_report_native_exit(data_t(), integer()) :: data_t()
+  def maybe_report_native_exit(data, status)
+      when is_integer(status) and status > 0 and status <= 255 do
+    now = now_ms()
+
+    cond do
+      not crash_reporting_enabled?() ->
+        data
+
+      not is_nil(data[:shutdown_reason]) ->
+        data
+
+      is_integer(data[:last_native_crash_at]) and
+          now - data[:last_native_crash_at] <= @native_crash_exit_grace_ms ->
+        data
+
+      not crash_report_admitted?(data, now) ->
+        data
+
+      true ->
+        safe_report_native(native_exit_payload(data, status), native_crash_metadata(data.route))
+        Map.put(data, :last_crash_report_at, now)
+    end
+  end
+
+  def maybe_report_native_exit(data, _status), do: data
+
+  @spec native_exit_payload(data_t(), pos_integer()) :: map()
+  def native_exit_payload(data, status) do
+    %{
+      component: :rust_pipeline,
+      kind: :exit,
+      exit_status: status,
+      error_class: exit_error_class(status),
+      message:
+        sanitize_native_text(
+          data[:last_native_unparsed_line] || "Native pipeline exited with status #{status}",
+          512,
+          data
+        ),
+      frames: [],
+      gst_element: nil,
+      source_transport: route_source_transport(data.route),
+      destination_transports: route_destination_transports(data.route)
+    }
+  end
+
+  @spec exit_error_class(pos_integer()) :: String.t()
+  def exit_error_class(134), do: "native_exit_sigabrt"
+  def exit_error_class(137), do: "native_exit_sigkill_or_oom"
+  def exit_error_class(139), do: "native_exit_sigsegv"
+  def exit_error_class(143), do: "native_exit_sigterm"
+  def exit_error_class(status) when status >= 128, do: "native_exit_signal"
+  def exit_error_class(_status), do: "native_process_exit"
+
+  @spec crash_report_admitted?(data_t(), integer()) :: boolean()
+  def crash_report_admitted?(data, now) do
+    case data[:last_crash_report_at] do
+      nil -> true
+      last when is_integer(last) -> now - last >= @native_crash_report_interval_ms
+      _ -> false
+    end
+  end
+
+  @spec safe_report_native(map(), map()) :: :ok | :error
+  def safe_report_native(native_payload, metadata) do
+    Crash.report_native(native_payload, metadata)
+  rescue
+    _error -> :error
+  catch
+    _kind, _reason -> :error
+  end
+
+  @spec crash_reporting_enabled?() :: boolean()
+  def crash_reporting_enabled?, do: Settings.crash_enabled?()
+
+  @spec native_crash_metadata(json_map()) :: map()
+  def native_crash_metadata(_route) do
+    %{
+      distribution: HydraSrt.Telemetry.Config.distribution(),
+      os_family: HydraSrt.Telemetry.Config.os_family(),
+      arch: HydraSrt.Telemetry.Config.arch()
+    }
+  end
+
+  @spec runtime_distribution() :: :docker | :release | :source
+  def runtime_distribution do
+    case System.get_env("HYDRA_DISTRIBUTION") do
+      "docker" -> :docker
+      "release" -> :release
+      _ -> :source
+    end
+  end
+
+  @spec route_source_transport(json_map()) :: atom()
+  def route_source_transport(route) when is_map(route) do
+    case route["sources"] do
+      sources when is_list(sources) ->
+        route
+        |> source_record_from_route(route["active_source_id"])
+        |> case do
+          {:ok, source} -> normalize_route_transport(source["schema"])
+          _ -> :unknown
+        end
+
+      _ ->
+        :unknown
+    end
+  end
+
+  @spec route_destination_transports(json_map()) :: [atom()]
+  def route_destination_transports(route) when is_map(route) do
+    case route["destinations"] do
+      destinations when is_list(destinations) ->
+        destinations
+        |> Enum.filter(&destination_enabled?/1)
+        |> Enum.filter(&is_map/1)
+        |> Enum.map(&normalize_route_transport(&1["schema"]))
+        |> Enum.uniq()
+
+      _ ->
+        []
+    end
+  end
+
+  @spec normalize_route_transport(term()) :: atom()
+  def normalize_route_transport("SRT"), do: :srt
+  def normalize_route_transport("UDP"), do: :udp
+  def normalize_route_transport("RTMP"), do: :rtmp
+  def normalize_route_transport("RTP"), do: :rtp
+  def normalize_route_transport("NDI"), do: :ndi
+  def normalize_route_transport("YOUTUBE"), do: :youtube
+  def normalize_route_transport("HLS"), do: :youtube
+  def normalize_route_transport(_schema), do: :unknown
+
+  @spec normalize_native_transport(term()) :: atom()
+  def normalize_native_transport("srt"), do: :srt
+  def normalize_native_transport("udp"), do: :udp
+  def normalize_native_transport("rtmp"), do: :rtmp
+  def normalize_native_transport("rtp"), do: :rtp
+  def normalize_native_transport("ndi"), do: :ndi
+  def normalize_native_transport("youtube"), do: :youtube
+  def normalize_native_transport("hls"), do: :youtube
+  def normalize_native_transport("unknown"), do: :unknown
+  def normalize_native_transport(_value), do: :unknown
+
+  @spec remember_native_line(data_t(), String.t()) :: data_t()
+  def remember_native_line(data, line) when is_map(data) and is_binary(line) do
+    data
+    |> Map.put(:last_native_unparsed_line, sanitize_native_text(line, 512, data))
+    |> Map.put(:last_native_line_at, now_ms())
   end
 
   @spec maybe_handle_zero_bitrate(data_t(), json_map()) :: data_t()
@@ -1763,6 +2184,9 @@ defmodule HydraSrt.RouteHandler do
 
       {:ok, %{"event" => "route_terminal"} = payload} ->
         {:route_terminal, payload}
+
+      {:ok, %{"event" => "crash"} = payload} ->
+        {:crash, payload}
 
       {:ok, %{"event" => _event}} ->
         :unknown

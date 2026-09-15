@@ -166,6 +166,12 @@ pub fn attach_bus_watch(
                     retry_domain,
                     Some(&detail),
                 );
+                let _ = event_sink.emit_gst_error(&crate::crash::GstCrashInput {
+                    error_class: classification.code.as_str().to_owned(),
+                    message: detail.clone(),
+                    gst_element: msg.src().map(|src| src.name().to_string()),
+                    retryable: classification.retryable,
+                });
                 let element_name = msg.src().map(|src| src.name());
                 let category = if access_denied {
                     HLS_ACCESS_CATEGORY

@@ -11,6 +11,7 @@ type InitData = {
   rust_version: string;
   app_started_at: string | null;
   demo_data: boolean;
+  sentry_dsn: string | null;
 };
 
 const INIT_FALLBACK: InitData = {
@@ -22,6 +23,7 @@ const INIT_FALLBACK: InitData = {
   rust_version: 'unknown',
   app_started_at: null,
   demo_data: false,
+  sentry_dsn: null,
 };
 const InitContext = createContext<InitData>(INIT_FALLBACK);
 

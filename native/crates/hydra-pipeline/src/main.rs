@@ -1,32 +1,44 @@
 mod cli;
 
 use std::io::{self, BufRead};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
 use gstreamer as gst;
 use hydra_plan::plan;
 use serde_json::json;
+use std::fmt;
 
 use crate::cli::{parse_args, ProcessKind};
 use hydra_media::build::{build, RunningGraph};
+use hydra_media::crash::{emit_fatal, hydra_test_crash_if_requested, install_panic_hook};
 use hydra_media::events::{EventSink, RetryDomain, RouteIdentity};
 use hydra_media::health::attach_bus_watch;
 use hydra_media::lifecycle::{PipelineStatus, StopReason};
-use hydra_media::output::{DiscardWriter, StatsWriter, StdoutWriter};
+use hydra_media::output::{DiscardWriter, SharedStdout, StatsWriter, StdoutWriter};
 use hydra_media::stats::start_stats_loop;
 
 fn main() {
-    match run() {
-        Ok(()) => {}
-        Err(err) => {
-            eprintln!("{err:#}");
+    let writer = writer();
+    install_panic_hook(writer.clone());
+
+    let result = catch_unwind(AssertUnwindSafe(|| run(writer.clone())));
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) if err.downcast_ref::<RouteFailureReported>().is_some() => {
+            eprintln!("native route failure")
+        }
+        Ok(Err(err)) => {
+            emit_fatal(&err, &writer);
+            eprintln!("{}", hydra_media::crash::scrub_text(&err.to_string(), 512));
             std::process::exit(1);
         }
+        Err(_) => std::process::exit(101),
     }
 }
 
-fn run() -> Result<()> {
+fn run(writer: SharedStdout) -> Result<()> {
     std::env::set_var("GST_REGISTRY_FORK", "no");
     let process_kind = match parse_args(std::env::args().skip(1)) {
         Ok(kind) => kind,
@@ -38,7 +50,7 @@ fn run() -> Result<()> {
     match &process_kind {
         ProcessKind::NdiDiscovery { helper_instance_id } => {
             gst::init().context("failed to initialize gstreamer")?;
-            hydra_media::ndi_discovery::run(writer(), helper_instance_id)
+            hydra_media::ndi_discovery::run(writer, helper_instance_id)
         }
         ProcessKind::NdiProbe { probe_instance_id } => {
             gst::init().context("failed to initialize gstreamer")?;
@@ -47,7 +59,7 @@ fn run() -> Result<()> {
                 .lock()
                 .read_line(&mut line)
                 .context("failed to read NDI probe json from stdin")?;
-            let output = writer();
+            let output = writer;
             let mut output = output
                 .lock()
                 .map_err(|_| anyhow!("writer mutex poisoned"))?;
@@ -62,7 +74,7 @@ fn run() -> Result<()> {
                 .context("failed to read route json from stdin")?;
             validate_config(&line)
         }
-        ProcessKind::Route { route_id, .. } => run_route_process(route_id, &process_kind),
+        ProcessKind::Route { route_id, .. } => run_route_process(route_id, &process_kind, writer),
     }
 }
 
@@ -100,39 +112,70 @@ fn build_failure(error: hydra_media::build::BuildError) -> (hydra_plan::ErrorCod
     (error.code(), error.detail().to_owned())
 }
 
-fn run_route_process(route_id: &str, process_kind: &ProcessKind) -> Result<()> {
-    let writer = writer();
+fn run_route_process(
+    route_id: &str,
+    process_kind: &ProcessKind,
+    writer: SharedStdout,
+) -> Result<()> {
+    if let ProcessKind::Route {
+        process_instance_id,
+        ..
+    } = process_kind
+    {
+        hydra_media::crash::set_current_context(hydra_media::crash::CrashContext::for_process(
+            route_id,
+            process_instance_id,
+        ));
+        hydra_test_crash_if_requested();
+    }
     let event_sink = EventSink::new(writer.clone(), route_identity(route_id, process_kind));
     emit_route_id(&writer, route_id)?;
-    if let Err(error) = gst::init().context("failed to initialize gstreamer") {
+    let result = if let Err(error) = gst::init().context("failed to initialize gstreamer") {
         let _ = event_sink.emit_route_terminal(
             hydra_plan::ErrorCode::RuntimeError,
             false,
             RetryDomain::None,
             Some(&error.to_string()),
         );
-        return Err(error);
-    }
-    let stdin = io::stdin();
-    let mut line = String::new();
-    if let Err(error) = stdin
-        .lock()
-        .read_line(&mut line)
-        .context("failed to read pipeline json from stdin")
-    {
-        let _ = event_sink.emit_route_terminal(
-            hydra_plan::ErrorCode::ConfigInvalid,
-            false,
-            RetryDomain::None,
-            Some(&error.to_string()),
-        );
-        return Err(error);
-    }
+        Err(error)
+    } else {
+        let stdin = io::stdin();
+        let mut line = String::new();
+        if let Err(error) = stdin
+            .lock()
+            .read_line(&mut line)
+            .context("failed to read pipeline json from stdin")
+        {
+            let _ = event_sink.emit_route_terminal(
+                hydra_plan::ErrorCode::ConfigInvalid,
+                false,
+                RetryDomain::None,
+                Some(&error.to_string()),
+            );
+            Err(error)
+        } else {
+            run_route(&line, writer, event_sink.clone())
+        }
+    };
 
-    run_route(&line, writer, event_sink)
+    match result {
+        Err(_error) if event_sink.route_terminal_emitted() => Err(RouteFailureReported.into()),
+        result => result,
+    }
 }
 
-fn writer() -> Arc<Mutex<Box<dyn StatsWriter>>> {
+#[derive(Debug)]
+struct RouteFailureReported;
+
+impl fmt::Display for RouteFailureReported {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("native route failure already reported")
+    }
+}
+
+impl std::error::Error for RouteFailureReported {}
+
+fn writer() -> SharedStdout {
     Arc::new(Mutex::new(Box::new(StdoutWriter::new())))
 }
 
@@ -152,6 +195,9 @@ fn run_route(
         Ok(config) => config,
         Err(error) => return plan_failure(&event_sink, error),
     };
+    hydra_media::crash::set_current_context(hydra_media::crash::CrashContext::from_route_config(
+        &config,
+    ));
     let event_sink = event_sink.with_identity(RouteIdentity {
         route_id: config.route_id.clone(),
         config_revision: config.config_revision.clone(),

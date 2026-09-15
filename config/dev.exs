@@ -30,7 +30,8 @@ config :hydra_srt, HydraSrtWeb.Endpoint,
 
 config :hydra_srt,
   api_auth_username: System.get_env("API_AUTH_USERNAME") || "admin",
-  api_auth_password: System.get_env("API_AUTH_PASSWORD") || "password123"
+  api_auth_password: System.get_env("API_AUTH_PASSWORD") || "password123",
+  telemetry: [enabled?: System.get_env("HYDRA_TELEMETRY_DEV_SEND") == "1"]
 
 # ## SSL Support
 #

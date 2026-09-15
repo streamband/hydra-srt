@@ -1,4 +1,5 @@
 use std::io::{self, Write};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -6,6 +7,8 @@ use serde::Serialize;
 pub trait StatsWriter: Send {
     fn send_message(&mut self, message: &str) -> Result<()>;
 }
+
+pub type SharedStdout = Arc<Mutex<Box<dyn StatsWriter>>>;
 
 pub fn send_json_line(writer: &mut dyn StatsWriter, value: &impl Serialize) -> Result<()> {
     let line = serde_json::to_string(value).context("failed to serialize json line")?;
@@ -43,12 +46,12 @@ impl StatsWriter for DiscardWriter {
 
 impl StatsWriter for StdoutWriter {
     fn send_message(&mut self, message: &str) -> Result<()> {
+        let mut line = Vec::with_capacity(message.len() + 1);
+        line.extend_from_slice(message.as_bytes());
+        line.push(b'\n');
         self.stdout
-            .write_all(message.as_bytes())
+            .write_all(&line)
             .context("failed to write message to stdout")?;
-        self.stdout
-            .write_all(b"\n")
-            .context("failed to write newline to stdout")?;
         self.stdout.flush().context("failed to flush stdout")?;
         Ok(())
     }

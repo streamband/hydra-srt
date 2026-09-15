@@ -1,12 +1,12 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
 use hydra_plan::ErrorCode;
 use serde::Serialize;
 
-use crate::output::{send_json_line, StatsWriter};
+use crate::output::{send_json_line, SharedStdout};
 
 const DETAIL_MAX_BYTES: usize = 500;
 
@@ -127,7 +127,7 @@ impl Serialize for RetryDomain {
 
 #[derive(Clone)]
 pub struct EventSink {
-    writer: Arc<Mutex<Box<dyn StatsWriter>>>,
+    writer: SharedStdout,
     identity: RouteIdentity,
     sequence: Arc<AtomicU64>,
     route_terminal_emitted: Arc<AtomicBool>,
@@ -145,7 +145,7 @@ impl std::fmt::Debug for EventSink {
 }
 
 impl EventSink {
-    pub fn new(writer: Arc<Mutex<Box<dyn StatsWriter>>>, identity: RouteIdentity) -> Self {
+    pub fn new(writer: SharedStdout, identity: RouteIdentity) -> Self {
         Self {
             writer,
             identity,
@@ -260,6 +260,11 @@ impl EventSink {
         };
 
         self.write_event(&event)
+    }
+
+    pub fn emit_gst_error(&self, input: &crate::crash::GstCrashInput) -> Result<()> {
+        crate::crash::emit_gst_error(input, &self.writer);
+        Ok(())
     }
 
     pub fn emit_media_info(
@@ -424,6 +429,7 @@ fn observed_at_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::output::StatsWriter;
     use std::sync::{Arc, Mutex};
 
     #[derive(Debug, Default)]

@@ -68,6 +68,7 @@ defmodule HydraSrt.MixProject do
       {:telemetry_metrics, "~> 1.0"},
       {:telemetry_poller, "~> 1.0"},
       {:prom_ex, "~> 1.11"},
+      {:sentry, "~> 13.5.1"},
       {:peep, "~> 4.2", override: true},
       {:observer_cli, "~> 1.7"},
 
@@ -179,7 +180,7 @@ defmodule HydraSrt.MixProject do
       ],
       # The final CI step runs the suite through ExCoveralls so coverage is emitted without a second run.
       ci: [
-        "hex.audit",
+        "cmd mix hex.audit",
         "compile --warnings-as-errors",
         "deps.unlock --check-unused",
         "format --check-formatted",
@@ -194,7 +195,7 @@ defmodule HydraSrt.MixProject do
         "compile --warnings-as-errors",
         "credo --strict",
         "sobelow",
-        "hex.audit",
+        "cmd mix hex.audit",
         "ex_dna",
         "reach.check --arch --smells --strict --baseline .reach.baseline.json",
         "dialyzer"

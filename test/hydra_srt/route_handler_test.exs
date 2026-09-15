@@ -47,6 +47,10 @@ defmodule HydraSrt.RouteHandlerTest do
         process_instance_id: nil,
         endpoint_health: %{},
         route_terminal: nil,
+        last_native_crash_at: nil,
+        last_native_unparsed_line: nil,
+        last_native_line_at: nil,
+        last_crash_report_at: nil,
         source_loss_since_ms: nil,
         source_loss_signal: nil,
         source_data_seen?: false,
@@ -3537,5 +3541,185 @@ defmodule HydraSrt.RouteHandlerTest do
 
       :gen_statem.stop(pid, :normal, 1000)
     end
+  end
+
+  describe "native crash ingestion" do
+    setup do
+      :meck.new(HydraSrt.Telemetry.Settings, [:passthrough])
+      :meck.new(HydraSrt.Telemetry.Crash, [:passthrough])
+
+      on_exit(fn -> :meck.unload() end)
+      :ok
+    end
+
+    test "reports a matching crash with only sanitized route context" do
+      test_pid = self()
+      :meck.expect(HydraSrt.Telemetry.Settings, :crash_enabled?, fn -> true end)
+
+      :meck.expect(HydraSrt.Telemetry.Crash, :report_native, fn payload, metadata ->
+        send(test_pid, {:native_crash, payload, metadata})
+        :ok
+      end)
+
+      data = crash_data()
+      payload = native_crash_payload(data)
+      next_data = RouteHandler.process_port_line(Jason.encode!(payload), data)
+
+      expected = RouteHandler.native_crash_payload(data, payload)
+      assert_receive {:native_crash, ^expected, metadata}
+      assert metadata.distribution == :source
+      assert metadata.os_family == HydraSrt.Telemetry.Config.os_family()
+      assert next_data.last_native_crash_at != nil
+      refute Map.has_key?(expected, :route_id)
+      refute Map.has_key?(expected, :process_instance_id)
+      refute expected.message =~ "secret"
+      refute expected.message =~ "example.com"
+      refute expected.message =~ "192.0.2.4"
+      refute expected.message =~ "/home"
+    end
+
+    test "rejects malformed crash payloads and stale process identities" do
+      :meck.expect(HydraSrt.Telemetry.Settings, :crash_enabled?, fn -> true end)
+
+      :meck.expect(HydraSrt.Telemetry.Crash, :report_native, fn _payload, _metadata ->
+        flunk("malformed native crash must not be reported")
+      end)
+
+      data = crash_data()
+
+      invalid_payloads = [
+        native_crash_payload(data) |> Map.put("kind", "unknown"),
+        native_crash_payload(data) |> Map.put("message", String.duplicate("x", 513)),
+        native_crash_payload(data)
+        |> Map.put("frames", List.duplicate(hd(native_crash_payload(data)["frames"]), 31)),
+        native_crash_payload(data) |> Map.put("route_source_transport", "bogus"),
+        native_crash_payload(data) |> Map.put("ts", -1)
+      ]
+
+      stale = native_crash_payload(data) |> Map.put("process_instance_id", "stale")
+
+      Enum.each(invalid_payloads, fn invalid ->
+        assert RouteHandler.process_port_line(Jason.encode!(invalid), data) == data
+      end)
+
+      assert RouteHandler.process_port_line(Jason.encode!(stale), data) == data
+    end
+
+    test "does not report when crash reporting is disabled" do
+      :meck.expect(HydraSrt.Telemetry.Settings, :crash_enabled?, fn -> false end)
+
+      :meck.expect(HydraSrt.Telemetry.Crash, :report_native, fn _payload, _metadata ->
+        flunk("disabled native crash must not be reported")
+      end)
+
+      data = crash_data()
+
+      assert RouteHandler.process_port_line(Jason.encode!(native_crash_payload(data)), data) ==
+               data
+    end
+
+    test "synthesizes a signal-killed exit and suppresses a nearby duplicate" do
+      test_pid = self()
+      :meck.expect(HydraSrt.Telemetry.Settings, :crash_enabled?, fn -> true end)
+
+      :meck.expect(HydraSrt.Telemetry.Crash, :report_native, fn payload, _metadata ->
+        send(test_pid, {:native_crash, payload})
+        :ok
+      end)
+
+      data = crash_data(%{port: make_ref(), retry_scheduled?: true})
+
+      assert {:keep_state, next_data} =
+               RouteHandler.handle_event(:info, {data.port, {:exit_status, 137}}, :started, data)
+
+      assert_receive {:native_crash,
+                      %{kind: :exit, exit_status: 137, error_class: "native_exit_sigkill_or_oom"}}
+
+      assert next_data.last_crash_report_at != nil
+
+      crash = native_crash_payload(next_data)
+
+      assert RouteHandler.process_port_line(Jason.encode!(crash), next_data).last_native_crash_at !=
+               nil
+
+      refute_receive {:native_crash, _}, 50
+    end
+
+    test "rate limits reports and suppresses intentional stops" do
+      test_pid = self()
+      :meck.expect(HydraSrt.Telemetry.Settings, :crash_enabled?, fn -> true end)
+
+      :meck.expect(HydraSrt.Telemetry.Crash, :report_native, fn _payload, _metadata ->
+        send(test_pid, :native_crash)
+        :ok
+      end)
+
+      data = crash_data()
+      first = RouteHandler.process_port_line(Jason.encode!(native_crash_payload(data)), data)
+      second = RouteHandler.process_port_line(Jason.encode!(native_crash_payload(first)), first)
+      assert_receive :native_crash
+      refute_receive :native_crash, 50
+      assert second.last_native_crash_at != nil
+
+      stopped = %{data | shutdown_reason: :manual, port: make_ref(), retry_scheduled?: true}
+
+      assert {:keep_state, unchanged} =
+               RouteHandler.handle_event(
+                 :info,
+                 {stopped.port, {:exit_status, 1}},
+                 :started,
+                 stopped
+               )
+
+      refute_receive :native_crash, 50
+      assert unchanged.last_crash_report_at == nil
+    end
+  end
+
+  @spec crash_data(map()) :: map()
+  def crash_data(overrides \\ %{}) do
+    base_route_data(
+      Map.merge(
+        %{
+          id: "route-crash",
+          process_instance_id: "piid-crash",
+          route: %{
+            "active_source_id" => "source-crash",
+            "sources" => [%{"id" => "source-crash", "schema" => "SRT", "name" => "secret-route"}],
+            "destinations" => [%{"id" => "dest-crash", "schema" => "RTMP", "enabled" => true}]
+          }
+        },
+        overrides
+      )
+    )
+  end
+
+  @spec native_crash_payload(map()) :: map()
+  def native_crash_payload(data) do
+    %{
+      "event" => "crash",
+      "route_id" => data.id,
+      "config_revision" => "rev-crash",
+      "process_instance_id" => data.process_instance_id,
+      "kind" => "panic",
+      "error_class" => "panic",
+      "message" =>
+        "passphrase=secret srt://example.com:9000 192.0.2.4 /home/alice/config secret-route",
+      "frames" => [
+        %{
+          "module" => "hydra_pipeline",
+          "function" => "hydra_pipeline::run",
+          "file" => "/Users/alice/native/crates/hydra-pipeline/src/main.rs",
+          "line" => 10
+        }
+      ],
+      "thread" => "main",
+      "gst_element" => "src",
+      "pipeline_state" => "playing",
+      "route_source_transport" => "srt",
+      "route_destination_transports" => ["rtmp"],
+      "version" => "0.6.9",
+      "ts" => 1_760_000_000_000
+    }
   end
 end

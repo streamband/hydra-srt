@@ -12,7 +12,8 @@ defmodule HydraSrtWeb.InitController do
       erlang_version: erlang_version(),
       rust_version: rust_version(),
       app_started_at: app_started_at(),
-      demo_data: Application.get_env(:hydra_srt, :demo_data, false)
+      demo_data: Application.get_env(:hydra_srt, :demo_data, false),
+      sentry_dsn: sentry_dsn()
     })
   end
 
@@ -54,5 +55,12 @@ defmodule HydraSrtWeb.InitController do
 
   def app_started_at do
     Application.get_env(:hydra_srt, :app_started_at, nil)
+  end
+
+  @spec sentry_dsn() :: binary() | nil
+  def sentry_dsn do
+    if Application.get_env(:hydra_srt, :env) == :prod,
+      do: HydraSrt.Telemetry.Config.sentry_dsn(),
+      else: nil
   end
 end

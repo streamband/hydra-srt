@@ -1,4 +1,5 @@
 defmodule HydraSrtWeb.Endpoint do
+  use Sentry.PlugCapture
   use Phoenix.Endpoint, otp_app: :hydra_srt
 
   socket "/socket", HydraSrtWeb.UserSocket,
@@ -41,6 +42,7 @@ defmodule HydraSrtWeb.Endpoint do
   plug Plug.Parsers,
     parsers: [:urlencoded, :multipart, :json],
     pass: ["*/*"],
+    body_reader: {HydraSrtWeb.Plugs.RawBodyReader, :read_body, []},
     json_decoder: Phoenix.json_library()
 
   plug Plug.MethodOverride

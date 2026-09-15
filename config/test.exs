@@ -62,6 +62,7 @@ config :hydra_srt, HydraSrt.Repo,
 config :hydra_srt,
   victoria_metrics_url: "http://127.0.0.1:8428",
   victoria_logs_url: "http://127.0.0.1:9428",
+  telemetry: [enabled?: false],
   system_metrics_history: [enabled: false],
   stats_collector: [
     flush_interval_ms: 86_400_000,

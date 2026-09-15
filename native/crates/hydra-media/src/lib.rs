@@ -1,6 +1,7 @@
 pub mod adapters;
 pub mod branch;
 pub mod build;
+pub mod crash;
 pub mod events;
 pub mod health;
 pub mod lifecycle;

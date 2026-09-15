@@ -51,6 +51,7 @@ defmodule HydraSrt.Application do
        keys: :unique, name: HydraSrt.Rtmp.PublisherRegistry, partitions: runtime_schedulers},
       HydraSrt.BackupLock,
       HydraSrt.Repo,
+      HydraSrt.Telemetry.Supervisor,
       HydraSrt.AuthCleanup,
       HydraSrt.SignalGenerator,
       {Task.Supervisor, name: HydraSrt.TaskSupervisor},
