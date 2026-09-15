@@ -17,6 +17,7 @@ const toBoolean = (value: string | undefined | null, defaultValue: boolean): boo
 const devHost = process.env.VITE_DEV_HOST || 'localhost';
 const devPort = Number(process.env.VITE_DEV_PORT || 5173);
 const devStrictPort = toBoolean(process.env.VITE_DEV_STRICT_PORT, true);
+const buildSourcemap = toBoolean(process.env.VITE_BUILD_SOURCEMAP, false);
 
 const proxy = {
   // Web UI often uses page origin (e.g. http://LAN:5173) with API_BASE_URL matching
@@ -50,6 +51,10 @@ const coverage: CoverageOptions & { all: boolean } = {
 // https://vite.dev/config/
 export default defineConfig({
   plugins: [react()],
+  build: {
+    // Hidden writes maps without a sourceMappingURL comment so JS bytes match a no-map build.
+    sourcemap: buildSourcemap ? 'hidden' : false,
+  },
   server: {
     host: devHost,
     port: Number.isFinite(devPort) ? devPort : 5173,
