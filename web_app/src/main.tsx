@@ -1,5 +1,6 @@
 import ReactDOM from 'react-dom/client';
-import { ConfigProvider, theme } from 'antd';
+import * as Sentry from '@sentry/react';
+import { Button, ConfigProvider, Result, theme } from 'antd';
 import { StrictMode, useEffect, useState } from 'react';
 import type { ReactNode } from 'react';
 import { HashRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom';
@@ -235,12 +236,33 @@ if (!rootEl) {
   throw new Error('Root element not found');
 }
 
+Sentry.init({
+  dsn: 'https://ed635a0a0de91a059eb36d2b4140012a@o4512091677851648.ingest.de.sentry.io/4512091690565712',
+  release: `hydra-srt@${__HYDRA_VERSION__}`,
+  environment: import.meta.env.MODE,
+  sendDefaultPii: false,
+});
+
+const crashFallback = (
+  <Result
+    status="error"
+    title="Something went wrong"
+    extra={
+      <Button type="primary" onClick={() => window.location.reload()}>
+        Reload
+      </Button>
+    }
+  />
+);
+
 ReactDOM.createRoot(rootEl).render(
   <StrictMode>
-    <InitProvider>
-      <ConfigProvider theme={config}>
-        <App />
-      </ConfigProvider>
-    </InitProvider>
+    <Sentry.ErrorBoundary fallback={crashFallback}>
+      <InitProvider>
+        <ConfigProvider theme={config}>
+          <App />
+        </ConfigProvider>
+      </InitProvider>
+    </Sentry.ErrorBoundary>
   </StrictMode>,
 );

@@ -11,6 +11,75 @@ env:
   IMAGE: streamband/hydra-srt
 
 jobs:
+  sentry_sourcemaps:
+    name: Upload React source maps to Sentry
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ github.event.release.tag_name }}
+
+      - name: Validate VERSION matches release tag
+        env:
+          RAW_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          if ! [[ "${RAW_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Unexpected release tag format: '${RAW_TAG}' (expected vX.Y.Z)"
+            exit 1
+          fi
+          TAG_VERSION="${RAW_TAG#v}"
+          FILE_VERSION="$(tr -d '[:space:]' < VERSION)"
+          if [ "${FILE_VERSION}" != "${TAG_VERSION}" ]; then
+            echo "VERSION mismatch: VERSION file='${FILE_VERSION}', release tag='${RAW_TAG}' (expected '${TAG_VERSION}')"
+            exit 1
+          fi
+          echo "VERSION check passed: ${FILE_VERSION}"
+          echo "RELEASE_VERSION=${TAG_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          # Major version must match the Dockerfile builder so asset hashes match the image.
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: web_app/package-lock.json
+
+      - name: Build web app with source maps
+        working-directory: web_app
+        env:
+          VITE_BUILD_SOURCEMAP: 'true'
+        run: |
+          npm ci
+          npm run build
+
+      - name: Verify source maps were produced
+        run: |
+          map_count="$(find web_app/dist/assets -maxdepth 1 -name '*.map' | wc -l | tr -d ' ')"
+          if [ "${map_count}" = "0" ]; then
+            echo "No source maps found under web_app/dist/assets"
+            exit 1
+          fi
+          echo "Found ${map_count} source map file(s)"
+
+      - name: Upload source maps to Sentry
+        uses: getsentry/action-release@v3
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SENTRY_ORG: ${{ secrets.SENTRY_ORG }}
+          SENTRY_PROJECT: ${{ secrets.SENTRY_PROJECT }}
+          SENTRY_URL: https://de.sentry.io
+        with:
+          environment: production
+          release: hydra-srt@${{ env.RELEASE_VERSION }}
+          sourcemaps: ./web_app/dist/assets
+          url_prefix: '~/assets'
+          # inject rewrites JS; we need byte-for-byte match with the Docker image bundles.
+          inject: false
+          finalize: true
+
   build:
     name: Build ${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
