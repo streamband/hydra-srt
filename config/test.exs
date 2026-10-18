@@ -60,6 +60,7 @@ config :hydra_srt, HydraSrt.Repo,
   busy_timeout: if(shared_http_e2e_mode?, do: 15_000, else: 2_000)
 
 config :hydra_srt,
+  telemetry_http_request: &HydraSrt.TestSupport.TelemetryHttpClient.request/5,
   victoria_metrics_url: "http://127.0.0.1:8428",
   victoria_logs_url: "http://127.0.0.1:9428",
   system_metrics_history: [enabled: false],

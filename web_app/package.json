@@ -17,6 +17,7 @@
     "test:e2e": "playwright test"
   },
   "dependencies": {
+    "@sentry/react": "10.74.0",
     "antd": "^5.24.1",
     "phoenix": "^1.8.9",
     "react": "^19.0.0",

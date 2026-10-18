@@ -5,7 +5,7 @@ defmodule HydraSrtWeb.Plugs.SecureBrowserHeaders do
 
   @headers %{
     "content-security-policy" =>
-      "default-src 'self'; connect-src 'self' ws: wss:; img-src 'self' data:; script-src 'self'; style-src 'self' 'unsafe-inline'"
+      "default-src 'self'; connect-src 'self' ws: wss: https://o4512091677851648.ingest.de.sentry.io; img-src 'self' data:; script-src 'self'; style-src 'self' 'unsafe-inline'"
   }
 
   def init(opts), do: opts
