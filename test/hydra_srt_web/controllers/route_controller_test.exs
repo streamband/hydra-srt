@@ -153,6 +153,22 @@ defmodule HydraSrtWeb.RouteControllerTest do
     end
   end
 
+  describe "route statistics reset" do
+    setup [:create_route]
+
+    test "POST returns conflict when route is not running", %{conn: conn, route: %{id: id}} do
+      conn = post(conn, ~p"/api/routes/#{id}/stats/reset")
+
+      assert json_response(conn, 409) == %{"error" => "Route is not running"}
+    end
+
+    test "DELETE returns conflict when route is not running", %{conn: conn, route: %{id: id}} do
+      conn = delete(conn, ~p"/api/routes/#{id}/stats/reset")
+
+      assert json_response(conn, 409) == %{"error" => "Route is not running"}
+    end
+  end
+
   describe "tags" do
     test "GET /api/tags returns empty list when no routes exist", %{conn: conn} do
       conn = get(conn, ~p"/api/tags")

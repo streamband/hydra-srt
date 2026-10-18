@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type Key } from 'react';
-import { Table, Card, Button, Space, Typography, message, Modal, Dropdown, Tooltip, Input, Badge, Drawer, Tree, Empty, Tag, Select, DatePicker, Tabs, Collapse } from 'antd';
+import { Table, Card, Button, Space, Typography, message, Modal, Dropdown, Tooltip, Input, Badge, Drawer, Tree, Empty, Tag, Select, DatePicker, Tabs, Collapse, Segmented, Popconfirm, Alert } from 'antd';
 import {
   PlusOutlined,
   EditOutlined,
@@ -61,6 +61,7 @@ import {
   StatusAnalyticsData,
   StatusHistoryData,
   StatusHistoryEvent,
+  StatsSinceReset,
   StatsTreeNode,
   TagOption,
   TimeRangeQuery,
@@ -322,6 +323,96 @@ const buildStatsTreeData = (value: unknown, path = 'stats', label = 'stats'): St
   };
 };
 
+type StatsDrawerViewMode = 'total' | 'since_reset';
+
+const getSnapshotSinceReset = (snapshot: unknown): StatsSinceReset | null => {
+  if (!snapshot || typeof snapshot !== 'object') {
+    return null;
+  }
+
+  const sinceReset = (snapshot as Record<string, unknown>).since_reset;
+
+  if (!sinceReset || typeof sinceReset !== 'object') {
+    return null;
+  }
+
+  return sinceReset as StatsSinceReset;
+};
+
+const buildSinceResetTreeSource = (sinceReset: StatsSinceReset) => {
+  const counters = { ...sinceReset };
+  delete counters.reset_at;
+  delete counters.rebased_at;
+  return counters;
+};
+
+const buildTotalTreeSource = (snapshot: unknown) => {
+  if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) {
+    return snapshot;
+  }
+
+  const totals = { ...(snapshot as Record<string, unknown>) };
+  delete totals.since_reset;
+  return totals;
+};
+
+const formatResetTimestampLocal = (value: string | null | undefined) => {
+  if (!value) {
+    return null;
+  }
+
+  const date = new Date(value);
+
+  if (Number.isNaN(date.getTime())) {
+    return null;
+  }
+
+  return date.toLocaleString();
+};
+
+const formatElapsedSince = (value: string | null | undefined, nowMs: number) => {
+  if (!value) {
+    return null;
+  }
+
+  const atMs = new Date(value).getTime();
+
+  if (Number.isNaN(atMs) || atMs > nowMs) {
+    return null;
+  }
+
+  let totalSeconds = Math.floor((nowMs - atMs) / 1000);
+
+  if (totalSeconds < ONE_MINUTE_SECONDS) {
+    return 'less than a minute';
+  }
+
+  const months = Math.floor(totalSeconds / ONE_MONTH_SECONDS);
+  totalSeconds -= months * ONE_MONTH_SECONDS;
+
+  const days = Math.floor(totalSeconds / ONE_DAY_SECONDS);
+  totalSeconds -= days * ONE_DAY_SECONDS;
+
+  const hours = Math.floor(totalSeconds / ONE_HOUR_SECONDS);
+  totalSeconds -= hours * ONE_HOUR_SECONDS;
+
+  const minutes = Math.floor(totalSeconds / ONE_MINUTE_SECONDS);
+
+  if (months > 0) {
+    return `${months}mo`;
+  }
+
+  if (days > 0) {
+    return `${days}d`;
+  }
+
+  if (hours > 0) {
+    return `${hours}h`;
+  }
+
+  return `${minutes}m`;
+};
+
 const collectTreeKeys = (nodes: StatsTreeNode[]) => {
   const keys: string[] = [];
 
@@ -368,6 +459,11 @@ const Routes = () => {
   const [tagsLoadFailed, setTagsLoadFailed] = useState(false);
   const [routeStats, setRouteStats] = useState<RouteStatsMap>({});
   const [statsDrawerRouteId, setStatsDrawerRouteId] = useState<string | null>(null);
+  const [statsViewMode, setStatsViewMode] = useState<StatsDrawerViewMode>('total');
+  const [statsResetActionPending, setStatsResetActionPending] = useState(false);
+  const [statsResetPending, setStatsResetPending] = useState(false);
+  const [statsBaselineDropped, setStatsBaselineDropped] = useState(false);
+  const statsResetSnapshotRef = useRef<unknown>(null);
   const [loading, setLoading] = useState(true);
   const [pagination, setPagination] = useState({
     current: DEFAULT_PAGE,
@@ -1346,7 +1442,13 @@ const Routes = () => {
               aria-label={`Route stats for ${record.name || record.id}`}
               icon={<BarChartOutlined />}
               disabled={statsDisabled}
-              onClick={() => setStatsDrawerRouteId(record.id)}
+              onClick={() => {
+                const snapshot = routeStats[record.id]?.snapshot;
+                setStatsResetPending(false);
+                setStatsBaselineDropped(false);
+                setStatsViewMode(getSnapshotSinceReset(snapshot) ? 'since_reset' : 'total');
+                setStatsDrawerRouteId(record.id);
+              }}
             />
           </Tooltip>
         );
@@ -1450,8 +1552,100 @@ const Routes = () => {
   });
   const statsDrawerRoute = routes.find((route) => route.id === statsDrawerRouteId);
   const statsSnapshot = statsDrawerRouteId ? routeStats[statsDrawerRouteId]?.snapshot : null;
-  const statsTreeData = statsSnapshot ? [buildStatsTreeData(statsSnapshot)] : [];
+  // Reset and Clear only take effect on the next stats tick. Until that tick
+  // arrives the snapshot still describes the state before the action: plain
+  // totals after a first reset, the previous baseline's deltas after a repeat
+  // reset, and a baseline that no longer exists after a clear. None of those
+  // may be shown as the outcome of the action just taken.
+  const statsResetAwaitingTick =
+    statsResetPending && statsSnapshot === statsResetSnapshotRef.current;
+  const statsSinceReset = statsResetAwaitingTick ? null : getSnapshotSinceReset(statsSnapshot);
+  const hasStatsSinceReset = statsSinceReset !== null;
+  const statsResetAt = statsSinceReset?.reset_at;
+  const statsRebasedAt = statsSinceReset?.rebased_at;
+  // The route handler discards the baseline whenever the pipeline restarts, so
+  // a snapshot newer than the reset that still carries no since_reset block
+  // means the baseline is gone rather than late. Without that distinction the
+  // drawer would wait forever on a baseline that is never coming back.
+  const statsBaselineMissingAfterTick =
+    statsViewMode === 'since_reset' &&
+    !statsSinceReset &&
+    !statsResetAwaitingTick &&
+    !!statsSnapshot;
+  const statsEffectiveViewMode: StatsDrawerViewMode = statsBaselineMissingAfterTick
+    ? 'total'
+    : statsViewMode;
+  const statsAwaitingSinceReset = statsEffectiveViewMode === 'since_reset' && !statsSinceReset;
+  const statsTreeSource =
+    statsEffectiveViewMode === 'since_reset'
+      ? (statsSinceReset ? buildSinceResetTreeSource(statsSinceReset) : null)
+      : buildTotalTreeSource(statsSnapshot);
+  const statsTreeData = statsTreeSource ? [buildStatsTreeData(statsTreeSource)] : [];
   const expandedStatsKeys = collectTreeKeys(statsTreeData);
+  const statsResetAtLocal = formatResetTimestampLocal(statsResetAt);
+  const statsResetAtRelative = formatElapsedSince(statsResetAt, nowMs);
+  const statsRebasedAtLocal = formatResetTimestampLocal(
+    typeof statsRebasedAt === 'string' ? statsRebasedAt : null,
+  );
+
+  useEffect(() => {
+    if (statsResetAwaitingTick) {
+      return;
+    }
+
+    setStatsResetPending(false);
+
+    if (statsSinceReset) {
+      setStatsBaselineDropped(false);
+      return;
+    }
+
+    if (statsBaselineMissingAfterTick) {
+      setStatsBaselineDropped(true);
+      setStatsViewMode('total');
+    }
+  }, [statsBaselineMissingAfterTick, statsResetAwaitingTick, statsSinceReset]);
+
+  const handleResetStats = async () => {
+    if (!statsDrawerRouteId) {
+      return;
+    }
+
+    setStatsResetActionPending(true);
+
+    try {
+      await routesApi.resetStats(statsDrawerRouteId);
+      messageApi.success('Statistics reset');
+      statsResetSnapshotRef.current = statsSnapshot;
+      setStatsResetPending(true);
+      setStatsBaselineDropped(false);
+      setStatsViewMode('since_reset');
+    } catch (error) {
+      messageApi.error(getErrorMessage(error, 'Failed to reset route statistics'));
+    } finally {
+      setStatsResetActionPending(false);
+    }
+  };
+
+  const handleClearStatsReset = async () => {
+    if (!statsDrawerRouteId) {
+      return;
+    }
+
+    setStatsResetActionPending(true);
+
+    try {
+      await routesApi.clearStatsReset(statsDrawerRouteId);
+      statsResetSnapshotRef.current = statsSnapshot;
+      setStatsResetPending(true);
+      setStatsBaselineDropped(false);
+      setStatsViewMode('total');
+    } catch (error) {
+      messageApi.error(getErrorMessage(error, 'Failed to clear the statistics reset'));
+    } finally {
+      setStatsResetActionPending(false);
+    }
+  };
   const hasLocalFilters = normalizedRoutesFilter.length > 0 || selectedTags.length > 0;
   const tableTotal = hasLocalFilters ? filteredRoutes.length : pagination.total;
   const selectedRoutesCount = selectedRouteIds.length;
@@ -1750,17 +1944,91 @@ const Routes = () => {
         open={!!statsDrawerRouteId}
         onClose={() => setStatsDrawerRouteId(null)}
         width={640}
-      >
-        {statsTreeData.length > 0 ? (
-          <Tree
-            showLine
-            switcherIcon={<DownOutlined />}
-            expandedKeys={expandedStatsKeys}
-            treeData={statsTreeData}
-          />
-        ) : (
-          <Empty description="No stats received yet" />
+        extra={(
+          <Space>
+            {hasStatsSinceReset ? (
+              <Button
+                disabled={statsResetActionPending}
+                onClick={() => {
+                  void handleClearStatsReset();
+                }}
+              >
+                Clear
+              </Button>
+            ) : null}
+            <Popconfirm
+              title="Reset statistics?"
+              description="This discards the previous baseline and starts measuring from the current counters."
+              okText="Reset"
+              onConfirm={() => {
+                void handleResetStats();
+              }}
+            >
+              <Button loading={statsResetActionPending}>Reset</Button>
+            </Popconfirm>
+          </Space>
         )}
+      >
+        <Space direction="vertical" size="middle" style={{ width: '100%' }}>
+          <Text type="secondary">
+            {statsResetAtLocal && statsResetAtRelative
+              ? `Last reset: ${statsResetAtLocal} (${statsResetAtRelative} ago)`
+              : statsAwaitingSinceReset
+                ? 'Reset applied. Waiting for the next statistics update.'
+                : 'Statistics have not been reset'}
+          </Text>
+          <Segmented<StatsDrawerViewMode>
+            value={statsEffectiveViewMode}
+            onChange={(mode) => {
+              setStatsBaselineDropped(false);
+              setStatsViewMode(mode);
+            }}
+            options={[
+              { label: 'Total', value: 'total' },
+              {
+                label: hasStatsSinceReset ? (
+                  'Since reset'
+                ) : (
+                  <Tooltip title="Reset statistics first to view counters since reset">
+                    <span>Since reset</span>
+                  </Tooltip>
+                ),
+                value: 'since_reset',
+                disabled: !hasStatsSinceReset && !statsAwaitingSinceReset,
+              },
+            ]}
+          />
+          {statsBaselineDropped ? (
+            <Alert
+              type="warning"
+              showIcon
+              message="The reset baseline was discarded because the pipeline restarted. Showing totals. Reset again to start a new baseline."
+            />
+          ) : null}
+          {statsRebasedAtLocal ? (
+            <Alert
+              type="warning"
+              showIcon
+              message={`Counters restarted at ${statsRebasedAtLocal} (connection re-established). Figures cover the period since then, not since the reset.`}
+            />
+          ) : null}
+          {statsTreeData.length > 0 ? (
+            <Tree
+              showLine
+              switcherIcon={<DownOutlined />}
+              expandedKeys={expandedStatsKeys}
+              treeData={statsTreeData}
+            />
+          ) : (
+            <Empty
+              description={
+                statsAwaitingSinceReset
+                  ? 'Waiting for the next statistics update'
+                  : 'No stats received yet'
+              }
+            />
+          )}
+        </Space>
       </Drawer>
     </div>
   );

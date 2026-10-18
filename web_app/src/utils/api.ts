@@ -265,6 +265,12 @@ export const routesApi = {
     }, 'Failed to switch source');
   },
 
+  resetStats: async (id: string) =>
+    requestJson(`/api/routes/${encodeURIComponent(id)}/stats/reset`, { method: 'POST' }, 'Failed to reset route statistics'),
+
+  clearStatsReset: async (id: string) =>
+    requestJson(`/api/routes/${encodeURIComponent(id)}/stats/reset`, { method: 'DELETE' }, 'Failed to clear the statistics reset'),
+
   // Test a route source with ffprobe
   testSource: async (routeData: Payload) => {
     const response = await authFetch('/api/routes/test-source', {

@@ -131,6 +131,29 @@ export type SrtHealthPoint = {
   retransmitted_packets_per_sec?: number | null;
   dropped_packets_per_sec?: number | null;
   nack_packets_per_sec?: number | null;
+  packets_lost_total?: number | null;
+  rtt_ms_max?: number | null;
+  packet_loss_percent_max?: number | null;
+  retransmitted_packets_per_sec_max?: number | null;
+  dropped_packets_per_sec_max?: number | null;
+  nack_packets_per_sec_max?: number | null;
+};
+
+export type SrtTotalsEntry = {
+  entity_type?: 'source' | 'destination';
+  entity_id?: string;
+  packets_total?: number | null;
+  packets_lost_total?: number | null;
+  packets_retransmitted_total?: number | null;
+  packets_dropped_total?: number | null;
+  nack_total?: number | null;
+  bytes_total?: number | null;
+  loss_percent?: number | null;
+};
+
+export type StatsResetMarker = {
+  timestamp?: string;
+  reason?: string | null;
 };
 
 export type AnalyticsMeta = Record<string, unknown> | null;
@@ -142,6 +165,8 @@ export type AnalyticsData = {
   source_timeline?: unknown[];
   srt_quality?: unknown[];
   srt_health?: SrtHealthPoint[];
+  srt_totals?: SrtTotalsEntry[];
+  stats_resets?: StatsResetMarker[];
 };
 
 export type StatusHistoryEvent = Record<string, unknown>;
@@ -155,6 +180,13 @@ export type StatusAnalyticsData = {
   points: AnalyticsPoint[];
   meta: Record<string, unknown> | null;
 };
+
+export type StatsSinceReset = {
+  reset_at?: string;
+  rebased_at?: string | null;
+  source?: Record<string, unknown>;
+  destinations?: Array<Record<string, unknown>>;
+} & Record<string, unknown>;
 
 export type RouteStatsEntry = {
   in?: number;

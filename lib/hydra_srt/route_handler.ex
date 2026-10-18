@@ -97,6 +97,10 @@ defmodule HydraSrt.RouteHandler do
           required(:retry_circuit_open?) => boolean(),
           required(:recovery_blocked?) => boolean(),
           required(:recovering?) => boolean(),
+          optional(:stats_baseline) => map() | nil,
+          optional(:stats_reset_at) => DateTime.t() | nil,
+          optional(:stats_rebased_at) => DateTime.t() | nil,
+          optional(:last_stats) => map() | nil,
           optional(:youtube_resolution_inflight?) => boolean(),
           optional(:youtube_failover_inflight?) => boolean(),
           optional(:now_ms) => integer(),
@@ -157,6 +161,218 @@ defmodule HydraSrt.RouteHandler do
       :exit, reason -> {:error, reason}
     end
   end
+
+  @doc false
+  @spec reset_stats(pid(), timeout()) :: {:ok, DateTime.t()} | {:error, term()}
+  def reset_stats(pid, timeout) when is_pid(pid) do
+    try do
+      :gen_statem.call(pid, :reset_stats, timeout)
+    catch
+      :exit, reason -> {:error, reason}
+    end
+  end
+
+  @doc false
+  @spec clear_stats_reset(pid(), timeout()) :: {:ok, nil} | {:error, term()}
+  def clear_stats_reset(pid, timeout) when is_pid(pid) do
+    try do
+      :gen_statem.call(pid, :clear_stats_reset, timeout)
+    catch
+      :exit, reason -> {:error, reason}
+    end
+  end
+
+  @doc false
+  @spec clear_stats_baseline(data_t()) :: data_t()
+  def clear_stats_baseline(data) when is_map(data) do
+    %{data | stats_baseline: nil, stats_reset_at: nil, stats_rebased_at: nil, last_stats: nil}
+  end
+
+  @doc false
+  @spec counter_fields() :: [binary()]
+  def counter_fields do
+    [
+      "packets-sent",
+      "packets-sent-lost",
+      "packets-retransmitted",
+      "packets-sent-dropped",
+      "packets-received",
+      "packets-received-lost",
+      "packets-received-retransmitted",
+      "packets-received-dropped",
+      "packet-ack-sent",
+      "packet-ack-received",
+      "packet-nack-sent",
+      "packet-nack-received",
+      "bytes-sent",
+      "bytes-received",
+      "bytes-retransmitted",
+      "bytes-sent-dropped",
+      "send-duration-us"
+    ]
+  end
+
+  @doc false
+  @spec stats_counters(map()) :: map()
+  def stats_counters(stats) when is_map(stats) do
+    counters =
+      case stats["source"] do
+        source when is_map(source) ->
+          source_counters =
+            %{}
+            |> maybe_put_numeric("bytes_in_total", source["bytes_in_total"])
+            |> maybe_put_srt_counters(source["srt"])
+
+          %{{:source, nil} => source_counters}
+
+        _ ->
+          %{}
+      end
+
+    counters =
+      case stats["destinations"] do
+        destinations when is_list(destinations) ->
+          Enum.reduce(destinations, counters, fn
+            %{"id" => id} = destination, acc when is_binary(id) ->
+              destination_counters =
+                %{}
+                |> maybe_put_numeric("bytes_out_total", destination["bytes_out_total"])
+                |> maybe_put_numeric("drops", destination["drops"])
+                |> maybe_put_srt_counters(destination["srt"])
+
+              Map.put(acc, {:destination, id}, destination_counters)
+
+            _destination, acc ->
+              acc
+          end)
+
+        _ ->
+          counters
+      end
+
+    maybe_put_numeric(counters, "total-bytes-received", stats["total-bytes-received"])
+  end
+
+  @doc false
+  @spec since_reset(map(), map(), DateTime.t(), DateTime.t() | nil) :: map()
+  def since_reset(stats, baseline, reset_at, rebased_at)
+      when is_map(stats) and is_map(baseline) and is_struct(reset_at, DateTime) do
+    current = stats_counters(stats)
+
+    diff = fn current_entity, baseline_entity ->
+      Enum.reduce(current_entity, %{}, fn
+        {"srt", current_srt}, acc when is_map(current_srt) ->
+          srt_deltas =
+            Enum.reduce(current_srt, %{}, fn {field, current_value}, srt_acc ->
+              case baseline_entity["srt"] do
+                baseline_srt when is_map(baseline_srt) ->
+                  case baseline_srt[field] do
+                    baseline_value when is_number(baseline_value) and is_number(current_value) ->
+                      Map.put(srt_acc, field, current_value - baseline_value)
+
+                    _ ->
+                      srt_acc
+                  end
+
+                _ ->
+                  srt_acc
+              end
+            end)
+
+          if map_size(srt_deltas) == 0, do: acc, else: Map.put(acc, "srt", srt_deltas)
+
+        {field, current_value}, acc when is_number(current_value) ->
+          case baseline_entity[field] do
+            baseline_value when is_number(baseline_value) ->
+              Map.put(acc, field, current_value - baseline_value)
+
+            _ ->
+              acc
+          end
+
+        _entry, acc ->
+          acc
+      end)
+    end
+
+    source_delta = diff.(current[{:source, nil}] || %{}, baseline[{:source, nil}] || %{})
+
+    destinations =
+      Enum.flat_map(current, fn
+        {{:destination, id}, current_destination} when is_binary(id) ->
+          case baseline[{:destination, id}] do
+            baseline_destination when is_map(baseline_destination) ->
+              [Map.put(diff.(current_destination, baseline_destination), "id", id)]
+
+            _ ->
+              []
+          end
+
+        _entry ->
+          []
+      end)
+
+    result = %{
+      "reset_at" => DateTime.to_iso8601(reset_at),
+      "rebased_at" => if(is_nil(rebased_at), do: nil, else: DateTime.to_iso8601(rebased_at)),
+      "source" => source_delta,
+      "destinations" => destinations
+    }
+
+    case {current["total-bytes-received"], baseline["total-bytes-received"]} do
+      {current_value, baseline_value}
+      when is_number(current_value) and is_number(baseline_value) ->
+        Map.put(result, "total-bytes-received", current_value - baseline_value)
+
+      _ ->
+        result
+    end
+  end
+
+  @doc false
+  @spec counters_regressed?(map(), map()) :: boolean()
+  def counters_regressed?(current, baseline) when is_map(current) and is_map(baseline) do
+    Enum.any?(baseline, fn
+      {field, baseline_value} when is_map(baseline_value) ->
+        case current[field] do
+          current_value when is_map(current_value) ->
+            counters_regressed?(current_value, baseline_value)
+
+          _ ->
+            false
+        end
+
+      {field, baseline_value} when is_number(baseline_value) ->
+        case current[field] do
+          current_value when is_number(current_value) -> current_value < baseline_value
+          _ -> false
+        end
+
+      _entry ->
+        false
+    end)
+  end
+
+  @spec maybe_put_numeric(map(), binary(), term()) :: map()
+  def maybe_put_numeric(map, key, value) when is_map(map) and is_binary(key) and is_number(value),
+    do: Map.put(map, key, value)
+
+  def maybe_put_numeric(map, _key, _value) when is_map(map), do: map
+
+  @spec maybe_put_srt_counters(map(), term()) :: map()
+  def maybe_put_srt_counters(map, srt) when is_map(map) and is_map(srt) do
+    counters =
+      Enum.reduce(counter_fields(), %{}, fn field, acc ->
+        case srt[field] do
+          value when is_number(value) -> Map.put(acc, field, value)
+          _ -> acc
+        end
+      end)
+
+    if map_size(counters) == 0, do: map, else: Map.put(map, "srt", counters)
+  end
+
+  def maybe_put_srt_counters(map, _srt) when is_map(map), do: map
 
   @spec endpoint_health_identity(data_t()) :: endpoint_health_identity()
   def endpoint_health_identity(data) when is_map(data) do
@@ -231,6 +447,10 @@ defmodule HydraSrt.RouteHandler do
       retry_circuit_open?: false,
       recovery_blocked?: false,
       recovering?: false,
+      stats_baseline: nil,
+      stats_reset_at: nil,
+      stats_rebased_at: nil,
+      last_stats: nil,
       youtube_resolution_inflight?: false,
       youtube_failover_inflight?: false
     }
@@ -265,7 +485,8 @@ defmodule HydraSrt.RouteHandler do
             if is_port(resolved_data.port) do
               close_existing_port(resolved_data.port)
               kill_stale_pipeline_processes(resolved_data.id, "youtube_refresh")
-              %{resolved_data | port: nil}
+
+              %{clear_stats_baseline(resolved_data) | port: nil}
             else
               resolved_data
             end
@@ -372,7 +593,9 @@ defmodule HydraSrt.RouteHandler do
     log_fun = if status == 0, do: &Logger.info/1, else: &Logger.error/1
     log_fun.("RouteHandler: native pipeline exited with status #{status}")
 
-    next_data = maybe_schedule_hard_retry_after_process_loss(%{data | port: nil})
+    next_data =
+      maybe_schedule_hard_retry_after_process_loss(%{clear_stats_baseline(data) | port: nil})
+
     {:keep_state, next_data}
   end
 
@@ -388,9 +611,11 @@ defmodule HydraSrt.RouteHandler do
     end
 
     if Enum.member?(@normal_port_exit_reasons, reason) do
-      {:stop, :normal, %{data | shutdown_reason: {:port_exit, reason}}}
+      {:stop, :normal, %{clear_stats_baseline(data) | shutdown_reason: {:port_exit, reason}}}
     else
-      next_data = maybe_schedule_hard_retry_after_process_loss(%{data | port: nil})
+      next_data =
+        maybe_schedule_hard_retry_after_process_loss(%{clear_stats_baseline(data) | port: nil})
+
       {:keep_state, next_data}
     end
   end
@@ -426,6 +651,37 @@ defmodule HydraSrt.RouteHandler do
 
   def handle_event({:call, from}, :get_endpoint_health, _state, data) do
     {:keep_state, data, [{:reply, from, {:ok, endpoint_health_identity(data)}}]}
+  end
+
+  def handle_event({:call, from}, :reset_stats, _state, data) do
+    case data[:last_stats] do
+      stats when is_map(stats) ->
+        reset_at = DateTime.utc_now()
+        EventLogger.log_stats_reset(data.id, "set")
+
+        {:keep_state,
+         %{
+           data
+           | stats_baseline: stats_counters(stats),
+             stats_reset_at: reset_at,
+             stats_rebased_at: nil
+         }, [{:reply, from, {:ok, reset_at}}]}
+
+      _ ->
+        {:keep_state, data, [{:reply, from, {:error, :no_stats_yet}}]}
+    end
+  end
+
+  def handle_event({:call, from}, :clear_stats_reset, _state, data) do
+    # Clearing is idempotent, but only an actual baseline removal is an event.
+    # Logging unconditionally would put reset markers on the health charts for
+    # resets that never happened.
+    if data[:stats_baseline] do
+      EventLogger.log_stats_reset(data.id, "cleared")
+    end
+
+    {:keep_state, %{data | stats_baseline: nil, stats_reset_at: nil, stats_rebased_at: nil},
+     [{:reply, from, {:ok, nil}}]}
   end
 
   def handle_event({:call, from}, {:switch_source, source_id, reason}, _state, data)
@@ -512,6 +768,10 @@ defmodule HydraSrt.RouteHandler do
              process_instance_id: process_instance_id,
              endpoint_health: %{},
              route_terminal: nil,
+             stats_baseline: nil,
+             stats_reset_at: nil,
+             stats_rebased_at: nil,
+             last_stats: nil,
              source_loss_since_ms: nil,
              source_loss_signal: nil,
              source_data_seen?: false,
@@ -526,9 +786,10 @@ defmodule HydraSrt.RouteHandler do
 
         next_data =
           if policy_deny_reason?(reason) do
-            mark_terminal_failure(data, reason)
+            mark_terminal_failure(clear_stats_baseline(data), reason)
           else
             data
+            |> clear_stats_baseline()
             |> mark_restarting_runtime()
             |> schedule_retry_restart()
           end
@@ -979,12 +1240,44 @@ defmodule HydraSrt.RouteHandler do
 
       {:stats, stats} ->
         # Logger.info("RouteHandler: pipeline stats: #{json}")
-        publish_stats(data.id, stats, %{
-          active_source_id: data.active_source_id,
-          active_source_position: active_source_position(data.route, data.active_source_id)
-        })
+        next_data = %{data | last_stats: stats}
 
-        data
+        next_data =
+          case data[:stats_baseline] do
+            nil ->
+              publish_stats(data.id, stats, %{
+                active_source_id: data.active_source_id,
+                active_source_position: active_source_position(data.route, data.active_source_id)
+              })
+
+              next_data
+
+            baseline ->
+              current_counters = stats_counters(stats)
+
+              {baseline, rebased_at} =
+                if counters_regressed?(current_counters, baseline) do
+                  {current_counters, DateTime.utc_now()}
+                else
+                  {baseline, data[:stats_rebased_at]}
+                end
+
+              published_stats =
+                Map.put(
+                  stats,
+                  "since_reset",
+                  since_reset(stats, baseline, data[:stats_reset_at], rebased_at)
+                )
+
+              publish_stats(data.id, published_stats, %{
+                active_source_id: data.active_source_id,
+                active_source_position: active_source_position(data.route, data.active_source_id)
+              })
+
+              %{next_data | stats_baseline: baseline, stats_rebased_at: rebased_at}
+          end
+
+        next_data
         |> maybe_handle_zero_bitrate(stats)
         |> maybe_probe_primary_recovery()
 
@@ -1282,6 +1575,10 @@ defmodule HydraSrt.RouteHandler do
                          process_instance_id: process_instance_id,
                          endpoint_health: %{},
                          route_terminal: nil,
+                         stats_baseline: nil,
+                         stats_reset_at: nil,
+                         stats_rebased_at: nil,
+                         last_stats: nil,
                          active_source_id: source_id,
                          last_manual_source_id: last_manual_source_id,
                          source_loss_since_ms: nil,
@@ -1301,6 +1598,7 @@ defmodule HydraSrt.RouteHandler do
 
                     failed_data =
                       next_data
+                      |> clear_stats_baseline()
                       |> Map.put(:port, nil)
                       |> schedule_retry_restart()
 
@@ -1310,9 +1608,13 @@ defmodule HydraSrt.RouteHandler do
               {:error, start_reason} ->
                 failed_data =
                   if policy_deny_reason?(start_reason) do
-                    mark_terminal_failure(%{next_data | port: nil}, start_reason)
+                    mark_terminal_failure(
+                      %{clear_stats_baseline(next_data) | port: nil},
+                      start_reason
+                    )
                   else
                     next_data
+                    |> clear_stats_baseline()
                     |> Map.put(:port, nil)
                     |> schedule_retry_restart()
                   end
@@ -1645,6 +1947,10 @@ defmodule HydraSrt.RouteHandler do
           process_instance_id: process_instance_id,
           endpoint_health: %{},
           route_terminal: nil,
+          stats_baseline: nil,
+          stats_reset_at: nil,
+          stats_rebased_at: nil,
+          last_stats: nil,
           active_source_id: source_id,
           source_loss_since_ms: nil,
           source_loss_signal: nil,
@@ -1664,9 +1970,10 @@ defmodule HydraSrt.RouteHandler do
         )
 
         if policy_deny_reason?(reason) do
-          mark_terminal_failure(%{data | port: nil}, reason)
+          mark_terminal_failure(%{clear_stats_baseline(data) | port: nil}, reason)
         else
           data
+          |> clear_stats_baseline()
           |> Map.put(:port, nil)
           |> mark_restarting_runtime()
           |> schedule_retry_restart()

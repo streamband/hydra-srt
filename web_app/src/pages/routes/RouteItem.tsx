@@ -1734,6 +1734,8 @@ const RouteItem = () => {
                   destinations={routeData?.destinations || []}
                   activeSourceId={routeData?.active_source_id}
                   points={analyticsData?.srt_health || []}
+                  totals={analyticsData?.srt_totals || []}
+                  resets={analyticsData?.stats_resets || []}
                   loading={analyticsLoading}
                   error={analyticsError}
                   routeActive={!isTerminalRuntimeStatus(routeData?.schema_status || routeData?.status)}

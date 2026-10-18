@@ -205,6 +205,18 @@ Supports:
 
 The UI uses this endpoint for CPU, RAM, network, and load average charts.
 
+Route analytics are served by `GET /api/routes/:route_id/analytics` and read from the same VictoriaMetrics store.
+
+### Route metrics downsampling and reset
+
+Route stats flow from `RouteHandler` through `HydraSrt.Stats.Collector` into VictoriaMetrics before the analytics API queries them.
+
+The collector downsamples one-second samples into ten-second buckets before writing. Within each bucket, gauges are averaged across samples. Metrics whose key ends in `_total`, plus `active_source_position`, are monotonic counters and keep the bucket sample with the highest timestamp. Five burst-sensitive gauges (`srt_rtt_ms`, `srt_packet_loss_percent`, `srt_retransmitted_packets_per_sec`, `srt_dropped_packets_per_sec`, `srt_nack_packets_per_sec`) also emit a companion `<key>_max` series holding the bucket maximum so short spikes survive downsampling.
+
+Cumulative counters (`srt_packets_total`, `srt_packets_lost_total`, `srt_packets_retransmitted_total`, `srt_packets_dropped_total`, `srt_nack_total`, `srt_bytes_total`, `bytes_in_total`, `bytes_out_total`) are stored monotonically and never rewritten. Window totals are derived by summing positive deltas between consecutive buckets. A counter restart on SRT reconnect contributes zero to the window total rather than a negative value.
+
+Resetting route statistics does not mutate stored history. The route handler holds a display baseline subtracted from live counter readings for the `since_reset` snapshot block. VictoriaMetrics samples and raw SRT socket counters remain unchanged.
+
 ## Failover Architecture
 
 HydraSRT supports source failover with a primary + N backup sources per route.
