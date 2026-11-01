@@ -159,6 +159,7 @@ RUN sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
 
 WORKDIR "/app"
 
+ENV HYDRA_DISTRIBUTION=docker
 ENV YT_DLP_PATH="/usr/local/bin/yt-dlp"
 
 # Create directory structure for mounted volumes
