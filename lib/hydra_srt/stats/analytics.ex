@@ -1,5 +1,7 @@
 defmodule HydraSrt.Stats.Analytics do
   @moduledoc false
+  require Logger
+
   alias HydraSrt.Db
   alias HydraSrt.Monitoring.OsMon
   alias HydraSrt.Stats.VictoriaLogs
@@ -63,6 +65,8 @@ defmodule HydraSrt.Stats.Analytics do
       initial_source_id = fetch_last_source_before_window(route_id, query_params, client)
       srt_quality = fetch_route_srt_quality(route_id, query_params, client)
       srt_health = fetch_route_srt_health(route_id, query_params, client)
+      srt_totals = fetch_route_srt_totals(route_id, query_params, client)
+      stats_resets = fetch_route_stats_resets(route_id, query_params, client)
 
       {:ok,
        %{
@@ -72,6 +76,8 @@ defmodule HydraSrt.Stats.Analytics do
            source_timeline_from_switches(switches, query_params, initial_source_id),
          srt_quality: srt_quality,
          srt_health: srt_health,
+         srt_totals: srt_totals,
+         stats_resets: stats_resets,
          meta: analytics_meta(query_params)
        }}
     end
@@ -474,15 +480,28 @@ defmodule HydraSrt.Stats.Analytics do
           {:ok, [map()]} | {:error, term()}
   def fetch_stats_rows(client, labels, metric_keys, query_params)
       when is_atom(client) and is_map(labels) and is_list(metric_keys) and is_map(query_params) do
+    fetch_stats_rows(client, labels, metric_keys, query_params, :avg)
+  end
+
+  @spec fetch_stats_rows(module(), map(), [binary()], query_params(), :avg | :max | :last) ::
+          {:ok, [map()]} | {:error, term()}
+  def fetch_stats_rows(client, labels, metric_keys, query_params, aggregation)
+      when is_atom(client) and is_map(labels) and is_list(metric_keys) and is_map(query_params) and
+             aggregation in [:avg, :max, :last] do
     bucket_seconds = max(div(query_params.bucket_ms, 1_000), 1)
     selector = stats_selector(labels, metric_keys)
-    query = "avg_over_time(#{selector}[#{bucket_seconds}s])"
+    query = "#{aggregation_function(aggregation)}(#{selector}[#{bucket_seconds}s])"
 
     case client.query_range(query, query_params.from, query_params.to, bucket_seconds) do
       {:ok, series} -> {:ok, stats_rows_from_series(series)}
       {:error, reason} -> {:error, reason}
     end
   end
+
+  @spec aggregation_function(:avg | :max | :last) :: binary()
+  defp aggregation_function(:avg), do: "avg_over_time"
+  defp aggregation_function(:max), do: "max_over_time"
+  defp aggregation_function(:last), do: "last_over_time"
 
   @spec stats_selector(map(), [binary()]) :: binary()
   def stats_selector(labels, metric_keys) when is_map(labels) and is_list(metric_keys) do
@@ -1111,29 +1130,209 @@ defmodule HydraSrt.Stats.Analytics do
     end
   end
 
+  @spec fetch_route_srt_health(binary(), query_params(), module()) :: [map()]
   def fetch_route_srt_health(route_id, query_params, client \\ VictoriaMetrics) do
-    metric_keys =
+    avg_metric_keys =
       ~w(srt_rtt_ms srt_negotiated_latency_ms srt_bandwidth_mbps srt_rate_mbps srt_packet_loss srt_packet_loss_percent srt_retransmitted_packets_per_sec srt_dropped_packets_per_sec srt_nack_packets_per_sec)
 
-    case fetch_stats_rows(client, %{"route_id" => route_id}, metric_keys, query_params) do
+    max_metric_keys =
+      ~w(srt_rtt_ms_max srt_packet_loss_percent_max srt_retransmitted_packets_per_sec_max srt_dropped_packets_per_sec_max srt_nack_packets_per_sec_max)
+
+    with {:ok, avg_rows} <-
+           fetch_stats_rows(client, %{"route_id" => route_id}, avg_metric_keys, query_params),
+         rows = health_rows(avg_rows),
+         max_rows <- fetch_health_max_rows(client, route_id, max_metric_keys, query_params) do
+      (rows ++ max_rows)
+      |> srt_health_points_from_rows()
+    else
+      {:error, _reason} -> []
+    end
+  end
+
+  @spec health_rows([map()]) :: [map()]
+  defp health_rows(rows) when is_list(rows) do
+    rows
+    |> Enum.filter(&(&1.entity_type in ["source", "destination"]))
+    |> Enum.map(fn row ->
+      %{
+        timestamp: normalize_timestamp(row.bucket_ts),
+        entity_type: row.entity_type,
+        entity_id: row.entity_id,
+        metric_key: row.metric_key,
+        value: number_or_nil(row.metric_value)
+      }
+    end)
+  end
+
+  @spec fetch_health_max_rows(module(), binary(), [binary()], query_params()) :: [map()]
+  defp fetch_health_max_rows(client, route_id, metric_keys, query_params) do
+    case fetch_stats_rows(
+           client,
+           %{"route_id" => route_id},
+           metric_keys,
+           query_params,
+           :max
+         ) do
       {:ok, rows} ->
-        rows
-        |> Enum.filter(&(&1.entity_type in ["source", "destination"]))
+        health_rows(rows)
+
+      {:error, reason} ->
+        Logger.warning("Failed to fetch route SRT health maxima: #{inspect(reason)}")
+        []
+    end
+  end
+
+  @spec fetch_route_srt_totals(binary(), query_params(), module()) :: [map()]
+  def fetch_route_srt_totals(route_id, query_params, client \\ VictoriaMetrics)
+      when is_binary(route_id) and is_map(query_params) do
+    metric_keys =
+      ~w(srt_packets_total srt_packets_lost_total srt_packets_retransmitted_total srt_packets_dropped_total srt_nack_total srt_bytes_total)
+
+    case fetch_stats_rows(
+           client,
+           %{"route_id" => route_id},
+           metric_keys,
+           query_params,
+           :last
+         ) do
+      {:ok, rows} -> srt_totals_from_rows(rows)
+      {:error, _reason} -> []
+    end
+  end
+
+  @spec positive_increase([number()]) :: number()
+  def positive_increase([]), do: 0
+  def positive_increase([_value]), do: 0
+
+  def positive_increase([first | rest]) when is_number(first) do
+    {_last, increase} =
+      Enum.reduce(rest, {first, 0}, fn value, {previous, increase} when is_number(value) ->
+        if value > previous do
+          {value, increase + value - previous}
+        else
+          {value, increase}
+        end
+      end)
+
+    increase
+  end
+
+  @spec srt_totals_from_rows([map()]) :: [map()]
+  defp srt_totals_from_rows(rows) when is_list(rows) do
+    metric_fields = %{
+      "srt_packets_total" => :packets_total,
+      "srt_packets_lost_total" => :packets_lost_total,
+      "srt_packets_retransmitted_total" => :packets_retransmitted_total,
+      "srt_packets_dropped_total" => :packets_dropped_total,
+      "srt_nack_total" => :nack_total,
+      "srt_bytes_total" => :bytes_total
+    }
+
+    rows =
+      Enum.filter(rows, fn row ->
+        row.entity_type in ["source", "destination"] and
+          Map.has_key?(metric_fields, row.metric_key)
+      end)
+
+    grouped_rows =
+      Enum.group_by(rows, fn row -> {row.entity_type, row.entity_id, row.metric_key} end)
+
+    rows
+    |> Enum.map(fn row -> {row.entity_type, row.entity_id} end)
+    |> Enum.uniq()
+    |> Enum.sort()
+    |> Enum.map(fn {entity_type, entity_id} ->
+      totals =
+        Enum.reduce(metric_fields, %{}, fn {metric_key, field}, acc ->
+          value =
+            case Map.fetch(grouped_rows, {entity_type, entity_id, metric_key}) do
+              {:ok, metric_rows} -> metric_increase(metric_rows)
+              :error -> nil
+            end
+
+          Map.put(acc, field, value)
+        end)
+
+      Map.merge(
+        %{entity_type: entity_type, entity_id: entity_id},
+        Map.put(totals, :loss_percent, loss_percent(entity_type, totals))
+      )
+    end)
+  end
+
+  @spec metric_increase([map()]) :: number() | nil
+  defp metric_increase(rows) when is_list(rows) do
+    values =
+      rows
+      |> Enum.sort_by(fn row -> DateTime.to_unix(row.bucket_ts, :microsecond) end)
+      |> Enum.map(& &1.metric_value)
+
+    if Enum.all?(values, &is_number/1), do: positive_increase(values), else: nil
+  end
+
+  @spec loss_percent(binary(), map()) :: float() | nil
+  defp loss_percent("source", totals) when is_map(totals) do
+    calculate_loss_percent(totals[:packets_total], totals[:packets_lost_total], fn total, lost ->
+      total + lost
+    end)
+  end
+
+  defp loss_percent("destination", totals) when is_map(totals) do
+    calculate_loss_percent(totals[:packets_total], totals[:packets_lost_total], fn total, _lost ->
+      total
+    end)
+  end
+
+  @spec calculate_loss_percent(number() | nil, number() | nil, (number(), number() -> number())) ::
+          float() | nil
+  defp calculate_loss_percent(total, lost, denominator_fun)
+       when is_function(denominator_fun, 2) do
+    if is_number(total) and is_number(lost) do
+      denominator = denominator_fun.(total, lost)
+      if denominator == 0, do: nil, else: lost / denominator * 100
+    end
+  end
+
+  @spec fetch_route_stats_resets(binary(), query_params(), module()) :: [map()]
+  def fetch_route_stats_resets(route_id, query_params, client \\ VictoriaMetrics)
+      when is_binary(route_id) and is_map(query_params) do
+    case fetch_events_by_type(
+           route_id,
+           "stats_reset",
+           query_params.from,
+           query_params.to,
+           client
+         ) do
+      {:ok, events} ->
+        events
+        |> Enum.filter(&(&1["event_type"] == "stats_reset"))
         |> Enum.map(fn row ->
           %{
-            timestamp: normalize_timestamp(row.bucket_ts),
-            entity_type: row.entity_type,
-            entity_id: row.entity_id,
-            metric_key: row.metric_key,
-            value: number_or_nil(row.metric_value)
+            "timestamp" => row["ts"],
+            "reason" => stats_reset_reason(row)
           }
         end)
-        |> srt_health_points_from_rows()
+        |> Enum.sort_by(& &1["timestamp"])
 
       {:error, _reason} ->
         []
     end
   end
+
+  @spec stats_reset_reason(map()) :: binary() | nil
+  defp stats_reset_reason(row) when is_map(row) do
+    row["reason"] || row["action"] || stats_reset_reason_from_details(row["details_json"])
+  end
+
+  @spec stats_reset_reason_from_details(term()) :: binary() | nil
+  defp stats_reset_reason_from_details(details_json) when is_binary(details_json) do
+    case Jason.decode(details_json) do
+      {:ok, details} when is_map(details) -> details["action"] || details["reason"]
+      _ -> nil
+    end
+  end
+
+  defp stats_reset_reason_from_details(_details_json), do: nil
 
   def srt_health_points_from_rows(rows) when is_list(rows) do
     rows
@@ -1149,7 +1348,8 @@ defmodule HydraSrt.Stats.Analytics do
 
       field =
         case row.metric_key do
-          "srt_packet_loss" -> "packet_loss_percent"
+          "srt_packet_loss" -> "packets_lost_total"
+          "srt_packet_loss_percent" -> "packet_loss_percent"
           metric_key -> String.replace_prefix(metric_key, "srt_", "")
         end
 

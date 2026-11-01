@@ -100,6 +100,22 @@ defmodule HydraSrt.Stats.EventLoggerTest do
     assert_receive {:event, %{"route_id" => "route-2", "event_type" => "route_status_change"}}
   end
 
+  test "log_stats_reset broadcasts the reset event shape" do
+    Phoenix.PubSub.subscribe(HydraSrt.PubSub, "events:route-reset")
+
+    :ok = EventLogger.log_stats_reset("route-reset", "set")
+
+    assert_receive {:event,
+                    %{
+                      "route_id" => "route-reset",
+                      "event_type" => "stats_reset",
+                      "severity" => "info",
+                      "reason" => "set",
+                      "message" => "Route statistics reset",
+                      "details_json" => "{\"action\":\"set\"}"
+                    }}
+  end
+
   describe "RTMP publisher events" do
     setup do
       Phoenix.PubSub.subscribe(HydraSrt.PubSub, "events:route-rtmp")

@@ -102,9 +102,9 @@ defmodule HydraSrt.Stats.MetricSelectorTest do
             "srt" => %{
               "packets-sent" => 855,
               "packets-sent-lost" => 7,
-              "packets-retransmitted" => 0,
+              "packets-retransmitted" => 8,
               "packet-ack-received" => 301,
-              "packet-nack-received" => 0,
+              "packet-nack-received" => 9,
               "send-duration-us" => 3_103_678,
               "bytes-sent" => 198_360,
               "bytes-retransmitted" => 0,
@@ -154,6 +154,25 @@ defmodule HydraSrt.Stats.MetricSelectorTest do
                row.metric_key == "srt_rtt_ms" and row.value_double == 12.5
            end)
 
+    for {metric_key, value} <- [
+          {"srt_packets_total", 855.0},
+          {"srt_packets_lost_total", 42.0},
+          {"srt_packets_retransmitted_total", 0.0},
+          {"srt_packets_dropped_total", 0.0},
+          {"srt_nack_total", 0.0},
+          {"srt_bytes_total", 198_360.0}
+        ] do
+      assert Enum.any?(rows, fn row ->
+               row.entity_type == "source" and row.entity_id == "source-1" and
+                 row.metric_key == metric_key and row.value_double == value
+             end)
+    end
+
+    assert Enum.any?(rows, fn row ->
+             row.entity_type == "source" and row.entity_id == "source-1" and
+               row.metric_key == "bytes_in_total" and row.value_double == 39_622_128.0
+           end)
+
     assert Enum.any?(rows, fn row ->
              row.entity_type == "destination" and row.entity_id == "dest-1" and
                row.metric_key == "bytes_out_per_sec" and row.value_double == 186_684.0
@@ -178,6 +197,42 @@ defmodule HydraSrt.Stats.MetricSelectorTest do
              row.entity_type == "destination" and row.entity_id == "dest-1" and
                row.metric_key == "srt_retransmitted_packets_per_sec" and row.value_double == 3.0
            end)
+
+    for {metric_key, value} <- [
+          {"srt_packets_total", 855.0},
+          {"srt_packets_lost_total", 7.0},
+          {"srt_packets_retransmitted_total", 8.0},
+          {"srt_packets_dropped_total", 0.0},
+          {"srt_nack_total", 9.0},
+          {"srt_bytes_total", 198_360.0}
+        ] do
+      assert Enum.any?(rows, fn row ->
+               row.entity_type == "destination" and row.entity_id == "dest-1" and
+                 row.metric_key == metric_key and row.value_double == value
+             end)
+    end
+
+    assert Enum.any?(rows, fn row ->
+             row.entity_type == "destination" and row.entity_id == "dest-1" and
+               row.metric_key == "bytes_out_total" and row.value_double == 39_622_128.0
+           end)
+  end
+
+  test "select_rows omits source counter rows when counter fields are missing" do
+    rows =
+      MetricSelector.select_rows(%{
+        route_id: "route-1",
+        stats: %{
+          "source" => %{
+            "srt" => %{
+              "rtt-ms" => 12.5
+            }
+          }
+        },
+        metadata: %{active_source_id: "source-1"}
+      })
+
+    refute Enum.any?(rows, fn row -> String.ends_with?(row.metric_key, "_total") end)
   end
 
   test "select_rows returns empty list for invalid envelope" do

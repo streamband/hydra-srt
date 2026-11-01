@@ -11,6 +11,14 @@ defmodule HydraSrt.Stats.Collector do
   @default_max_buffer_size 10_000
   @default_downsample_interval_ms 10_000
 
+  @max_companion_metrics [
+    "srt_rtt_ms",
+    "srt_packet_loss_percent",
+    "srt_retransmitted_packets_per_sec",
+    "srt_dropped_packets_per_sec",
+    "srt_nack_packets_per_sec"
+  ]
+
   @spec start_link(map()) :: GenServer.on_start()
   def start_link(opts \\ %{}) when is_map(opts) do
     name = Map.get(opts, :name, __MODULE__)
@@ -125,9 +133,108 @@ defmodule HydraSrt.Stats.Collector do
              is_integer(downsample_interval_ms) and downsample_interval_ms > 0 do
     Enum.reduce(rows, rows_by_bucket_and_series, fn row, acc ->
       key = row_bucket_and_series_key(row, downsample_interval_ms)
-      Map.put(acc, key, row)
+
+      Map.update(acc, key, new_accumulator(row), fn accumulator ->
+        merge_accumulator(accumulator, row)
+      end)
     end)
   end
+
+  @spec aggregation_for(binary()) :: :avg | :last
+  def aggregation_for("active_source_position"), do: :last
+
+  # srt_packet_loss is a cumulative lost-packet count from the SRT socket. Its
+  # name predates the _total suffix convention, so it needs an explicit clause,
+  # otherwise averaging inside the bucket would report less than the counter
+  # actually reached.
+  def aggregation_for("srt_packet_loss"), do: :last
+
+  def aggregation_for(metric_key) when is_binary(metric_key) do
+    if String.ends_with?(metric_key, "_total"), do: :last, else: :avg
+  end
+
+  @spec max_companion_metrics() :: [binary()]
+  def max_companion_metrics, do: @max_companion_metrics
+
+  @spec new_accumulator(map()) :: map()
+  def new_accumulator(row) when is_map(row) do
+    case {row[:value_type], row[:value_double]} do
+      {"double", value} when is_number(value) ->
+        value = value * 1.0
+
+        %{
+          row: row,
+          sum: value,
+          count: 1,
+          max: value,
+          last_ts_ms: row_ts_unix_ms(row)
+        }
+
+      _ ->
+        %{
+          row: row,
+          sum: nil,
+          count: nil,
+          max: nil,
+          last_ts_ms: row_ts_unix_ms(row)
+        }
+    end
+  end
+
+  @spec merge_accumulator(map(), map()) :: map()
+  def merge_accumulator(
+        %{row: row, sum: sum, count: count, max: max, last_ts_ms: last_ts_ms} = accumulator,
+        incoming_row
+      )
+      when is_map(incoming_row) do
+    incoming_ts_ms = row_ts_unix_ms(incoming_row)
+    representative = if incoming_ts_ms > last_ts_ms, do: incoming_row, else: row
+    representative_ts_ms = max(last_ts_ms, incoming_ts_ms)
+
+    case {incoming_row[:value_type], incoming_row[:value_double], sum, count, max} do
+      {"double", incoming_value, sum, count, max}
+      when is_number(incoming_value) and is_number(sum) and is_integer(count) and
+             is_number(max) ->
+        value = incoming_value * 1.0
+
+        %{
+          accumulator
+          | row: representative,
+            sum: sum + value,
+            count: count + 1,
+            max: Kernel.max(max, value),
+            last_ts_ms: representative_ts_ms
+        }
+
+      _ ->
+        %{accumulator | row: representative, last_ts_ms: representative_ts_ms}
+    end
+  end
+
+  @spec flush_accumulator(map()) :: [map()]
+  def flush_accumulator(%{row: row, sum: sum, count: count, max: max})
+      when is_map(row) and is_number(sum) and is_integer(count) and count > 0 and is_number(max) do
+    metric_key = row[:metric_key]
+
+    value_double =
+      case aggregation_for(metric_key) do
+        :avg -> sum / count
+        :last -> row[:value_double]
+      end
+
+    base_row = Map.put(row, :value_double, value_double)
+
+    if metric_key in max_companion_metrics() do
+      [
+        base_row,
+        base_row |> Map.put(:metric_key, metric_key <> "_max") |> Map.put(:value_double, max)
+      ]
+    else
+      [base_row]
+    end
+  end
+
+  def flush_accumulator(%{row: row}) when is_map(row), do: [row]
 
   @spec row_bucket_and_series_key(map(), pos_integer()) :: tuple()
   def row_bucket_and_series_key(row, downsample_interval_ms)
@@ -189,6 +296,7 @@ defmodule HydraSrt.Stats.Collector do
     rows =
       rows_by_bucket_and_series
       |> Map.values()
+      |> Enum.flat_map(&flush_accumulator/1)
       |> Enum.sort_by(fn row ->
         {
           row_ts_unix_ms(row),
@@ -223,7 +331,7 @@ defmodule HydraSrt.Stats.Collector do
 
     kept =
       rows_by_bucket_and_series
-      |> Enum.sort_by(fn {_key, row} -> row_ts_unix_ms(row) end, :desc)
+      |> Enum.sort_by(fn {_key, accumulator} -> row_ts_unix_ms(accumulator.row) end, :desc)
       |> Enum.take(max_buffer_size)
       |> Map.new()
 

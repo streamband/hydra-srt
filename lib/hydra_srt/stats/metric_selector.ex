@@ -10,7 +10,13 @@ defmodule HydraSrt.Stats.MetricSelector do
     {"srt_packet_loss_percent", "packet-loss-percent"},
     {"srt_retransmitted_packets_per_sec", "retransmitted-packets-per-sec"},
     {"srt_dropped_packets_per_sec", "dropped-packets-per-sec"},
-    {"srt_nack_packets_per_sec", "nack-packets-per-sec"}
+    {"srt_nack_packets_per_sec", "nack-packets-per-sec"},
+    {"srt_packets_total", "packets-received"},
+    {"srt_packets_lost_total", "packets-received-lost"},
+    {"srt_packets_retransmitted_total", "packets-received-retransmitted"},
+    {"srt_packets_dropped_total", "packets-received-dropped"},
+    {"srt_nack_total", "packet-nack-sent"},
+    {"srt_bytes_total", "bytes-received"}
   ]
 
   @destination_srt_metrics [
@@ -22,7 +28,13 @@ defmodule HydraSrt.Stats.MetricSelector do
     {"srt_packet_loss_percent", "packet-loss-percent"},
     {"srt_retransmitted_packets_per_sec", "retransmitted-packets-per-sec"},
     {"srt_dropped_packets_per_sec", "dropped-packets-per-sec"},
-    {"srt_nack_packets_per_sec", "nack-packets-per-sec"}
+    {"srt_nack_packets_per_sec", "nack-packets-per-sec"},
+    {"srt_packets_total", "packets-sent"},
+    {"srt_packets_lost_total", "packets-sent-lost"},
+    {"srt_packets_retransmitted_total", "packets-retransmitted"},
+    {"srt_packets_dropped_total", "packets-sent-dropped"},
+    {"srt_nack_total", "packet-nack-received"},
+    {"srt_bytes_total", "bytes-sent"}
   ]
 
   @doc false
@@ -81,6 +93,14 @@ defmodule HydraSrt.Stats.MetricSelector do
         get_in(stats, ["source", "bytes_in_per_sec"]),
         ts
       )
+      |> maybe_add_double_row(
+        route_id,
+        "source",
+        active_source_id,
+        "bytes_in_total",
+        get_in(stats, ["source", "bytes_in_total"]),
+        ts
+      )
 
     add_srt_rows(
       rows,
@@ -107,6 +127,14 @@ defmodule HydraSrt.Stats.MetricSelector do
           destination_id,
           "bytes_out_per_sec",
           Map.get(destination, "bytes_out_per_sec"),
+          ts
+        )
+        |> maybe_add_double_row(
+          route_id,
+          "destination",
+          destination_id,
+          "bytes_out_total",
+          Map.get(destination, "bytes_out_total"),
           ts
         )
         |> add_srt_rows(

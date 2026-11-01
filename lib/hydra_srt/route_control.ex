@@ -3,6 +3,8 @@ defmodule HydraSrt.RouteControl do
 
   alias HydraSrt.Db
 
+  @route_handler_call_timeout_ms :timer.seconds(5)
+
   @spec switch_route_source(String.t(), String.t()) ::
           {:ok, map()} | {:error, term()}
   def switch_route_source(route_id, source_id)
@@ -42,6 +44,34 @@ defmodule HydraSrt.RouteControl do
              true <- route_stopped?(route) or {:error, :route_handler_unavailable} do
           Db.set_route_active_source(route_id, source_id, "manual")
         end
+    end
+  end
+
+  @spec reset_route_stats(String.t()) :: {:ok, DateTime.t()} | {:error, term()}
+  def reset_route_stats(route_id) when is_binary(route_id) do
+    case HydraSrt.get_route_handler(route_id) do
+      {:ok, pid} ->
+        HydraSrt.RouteHandler.reset_stats(pid, @route_handler_call_timeout_ms)
+
+      {:error, reason} when reason in [:not_found, :route_handler_not_found] ->
+        {:error, :route_handler_unavailable}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @spec clear_route_stats_reset(String.t()) :: {:ok, nil} | {:error, term()}
+  def clear_route_stats_reset(route_id) when is_binary(route_id) do
+    case HydraSrt.get_route_handler(route_id) do
+      {:ok, pid} ->
+        HydraSrt.RouteHandler.clear_stats_reset(pid, @route_handler_call_timeout_ms)
+
+      {:error, reason} when reason in [:not_found, :route_handler_not_found] ->
+        {:error, :route_handler_unavailable}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 end

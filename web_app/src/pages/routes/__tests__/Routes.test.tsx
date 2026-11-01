@@ -51,6 +51,12 @@ vi.mock('../../../utils/api', () => ({
     start: vi.fn(async () => ({ data: { status: 'starting' } })),
     stop: vi.fn(async () => ({ data: { status: 'stopped' } })),
     delete: vi.fn(async () => ({ success: true })),
+    resetStats: vi.fn(async () => ({
+      data: { route_id: 'starting-route', stats_reset_at: '2026-05-15T10:00:00Z' },
+    })),
+    clearStatsReset: vi.fn(async () => ({
+      data: { route_id: 'starting-route', stats_reset_at: null },
+    })),
   },
   tagsApi: {
     getAll: vi.fn(async () => ({ data: [] })),
@@ -190,6 +196,22 @@ describe('Routes', () => {
       <Routes />
     </MemoryRouter>,
   );
+
+  const openStatsDrawer = async (routeName = 'Starting route') => {
+    await screen.findByText(routeName);
+    fireEvent.click(screen.getByRole('button', { name: new RegExp(`route stats for ${routeName}`, 'i') }));
+    await screen.findByText(/stats:/i);
+  };
+
+  const emitStatsSnapshot = (routeId: string, stats: Record<string, unknown>) => {
+    act(() => {
+      realtimeMock.__emitStats({
+        route_id: routeId,
+        metric: 'snapshot',
+        stats,
+      });
+    });
+  };
 
   beforeEach(() => {
     vi.clearAllMocks();
@@ -476,6 +498,250 @@ describe('Routes', () => {
     renderRoutes('/routes?page=2&time=live&status_view=history');
 
     await screen.findByRole('link', { name: 'Stopped route' });
+  });
+
+  it('shows reset status line and disables Since reset when snapshot has no since_reset block', async () => {
+    renderRoutes();
+
+    emitStatsSnapshot('starting-route', {
+      pipeline_marker: 'full-snapshot-only',
+      source: { bytes_in_total: 1000 },
+    });
+
+    await openStatsDrawer();
+
+    expect(screen.getByText('Statistics have not been reset')).toBeInTheDocument();
+    expect(screen.getByText('Since reset').closest('.ant-segmented-item-disabled')).not.toBeNull();
+  });
+
+  it('defaults to Since reset and shows last reset line when snapshot has since_reset', async () => {
+    renderRoutes();
+
+    emitStatsSnapshot('starting-route', {
+      pipeline_marker: 'full-snapshot-only',
+      since_reset: {
+        reset_at: '2026-05-15T10:00:00.000000Z',
+        rebased_at: null,
+        source: { bytes_in_total: 12345 },
+        destinations: [],
+      },
+    });
+
+    await openStatsDrawer();
+
+    expect(screen.getByText(/Last reset:/)).toBeInTheDocument();
+    expect(screen.getByText('Since reset').closest('.ant-segmented-item-selected')).not.toBeNull();
+    expect(screen.queryByText('pipeline_marker')).not.toBeInTheDocument();
+  });
+
+  it('renders full snapshot keys when switching to Total', async () => {
+    renderRoutes();
+
+    emitStatsSnapshot('starting-route', {
+      pipeline_marker: 'full-snapshot-only',
+      since_reset: {
+        reset_at: '2026-05-15T10:00:00.000000Z',
+        rebased_at: null,
+        source: { bytes_in_total: 12345 },
+        destinations: [],
+      },
+    });
+
+    await openStatsDrawer();
+
+    fireEvent.click(screen.getByText('Total'));
+
+    expect(await screen.findByText(/pipeline_marker/)).toBeInTheDocument();
+  });
+
+  it('omits the since_reset block from the Total tree', async () => {
+    renderRoutes();
+
+    emitStatsSnapshot('starting-route', {
+      pipeline_marker: 'full-snapshot-only',
+      since_reset: {
+        reset_at: '2026-05-15T10:00:00.000000Z',
+        rebased_at: null,
+        source: { bytes_in_total: 12345 },
+        destinations: [],
+      },
+    });
+
+    await openStatsDrawer();
+
+    fireEvent.click(screen.getByText('Total'));
+
+    expect(await screen.findByText(/pipeline_marker/)).toBeInTheDocument();
+    expect(screen.queryByText(/since_reset/)).not.toBeInTheDocument();
+  });
+
+  it('hides the previous baseline while a repeat reset awaits the next tick', async () => {
+    renderRoutes();
+
+    emitStatsSnapshot('starting-route', {
+      pipeline_marker: 'full-snapshot-only',
+      since_reset: {
+        reset_at: '2026-05-15T10:00:00.000000Z',
+        rebased_at: null,
+        source: { bytes_in_total: 12345 },
+        destinations: [],
+      },
+    });
+
+    await openStatsDrawer();
+
+    expect(screen.getByText(/Last reset:/)).toBeInTheDocument();
+
+    const [resetTrigger] = screen.getAllByRole('button', { name: /^reset$/i });
+    fireEvent.click(resetTrigger);
+    const resetButtons = await screen.findAllByRole('button', { name: /^reset$/i });
+    fireEvent.click(resetButtons[resetButtons.length - 1]);
+
+    await waitFor(() => {
+      expect(routesApi.resetStats).toHaveBeenCalledWith('starting-route');
+    });
+
+    expect(await screen.findByText('Waiting for the next statistics update')).toBeInTheDocument();
+    expect(screen.queryByText(/Last reset:/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/12345/)).not.toBeInTheDocument();
+  });
+
+  it('drops the reset status immediately after a successful clear', async () => {
+    renderRoutes();
+
+    emitStatsSnapshot('starting-route', {
+      pipeline_marker: 'full-snapshot-only',
+      since_reset: {
+        reset_at: '2026-05-15T10:00:00.000000Z',
+        rebased_at: null,
+        source: { bytes_in_total: 12345 },
+        destinations: [],
+      },
+    });
+
+    await openStatsDrawer();
+
+    expect(screen.getByText(/Last reset:/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: /^clear$/i }));
+
+    await waitFor(() => {
+      expect(routesApi.clearStatsReset).toHaveBeenCalledWith('starting-route');
+    });
+
+    expect(await screen.findByText('Statistics have not been reset')).toBeInTheDocument();
+    expect(screen.queryByText(/Last reset:/)).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^clear$/i })).not.toBeInTheDocument();
+    expect(screen.getByText('Since reset').closest('.ant-segmented-item-disabled')).not.toBeNull();
+  });
+
+  it('calls resetStats from the drawer Reset action', async () => {
+    renderRoutes();
+
+    emitStatsSnapshot('starting-route', {
+      source: { bytes_in_total: 1000 },
+    });
+
+    await openStatsDrawer();
+
+    const [resetTrigger] = screen.getAllByRole('button', { name: /^reset$/i });
+    fireEvent.click(resetTrigger);
+    const resetButtons = await screen.findAllByRole('button', { name: /^reset$/i });
+    fireEvent.click(resetButtons[resetButtons.length - 1]);
+
+    await waitFor(() => {
+      expect(routesApi.resetStats).toHaveBeenCalledWith('starting-route');
+    });
+  });
+
+  it('does not show plain totals under the Since reset label before the next tick', async () => {
+    renderRoutes();
+
+    emitStatsSnapshot('starting-route', {
+      source: { bytes_in_total: 1000 },
+    });
+
+    await openStatsDrawer();
+
+    const [resetTrigger] = screen.getAllByRole('button', { name: /^reset$/i });
+    fireEvent.click(resetTrigger);
+    const resetButtons = await screen.findAllByRole('button', { name: /^reset$/i });
+    fireEvent.click(resetButtons[resetButtons.length - 1]);
+
+    await waitFor(() => {
+      expect(routesApi.resetStats).toHaveBeenCalledWith('starting-route');
+    });
+
+    expect(await screen.findByText('Waiting for the next statistics update')).toBeInTheDocument();
+    expect(screen.getByText('Reset applied. Waiting for the next statistics update.')).toBeInTheDocument();
+    expect(screen.queryByText('Statistics have not been reset')).not.toBeInTheDocument();
+    expect(screen.queryByText(/bytes_in_total/i)).not.toBeInTheDocument();
+  });
+
+  it('falls back to totals when the backend drops the reset baseline', async () => {
+    renderRoutes();
+
+    emitStatsSnapshot('starting-route', {
+      source: { bytes_in_total: 1000 },
+      since_reset: {
+        reset_at: '2026-05-15T10:00:00.000000Z',
+        rebased_at: null,
+        source: { bytes_in_total: 10 },
+      },
+    });
+
+    await openStatsDrawer();
+
+    expect(await screen.findByText(/last reset:/i)).toBeInTheDocument();
+
+    // A pipeline restart clears the handler baseline, so later snapshots carry
+    // totals again with no since_reset block.
+    emitStatsSnapshot('starting-route', {
+      source: { bytes_in_total: 2000 },
+    });
+
+    expect(
+      await screen.findByText(/the reset baseline was discarded because the pipeline restarted/i),
+    ).toBeInTheDocument();
+    expect(screen.queryByText('Waiting for the next statistics update')).not.toBeInTheDocument();
+    expect(screen.getByText(/bytes_in_total/i)).toBeInTheDocument();
+  });
+
+  it('surfaces the server error when resetStats fails', async () => {
+    vi.mocked(routesApi.resetStats).mockRejectedValueOnce(new Error('No statistics received yet'));
+
+    renderRoutes();
+
+    emitStatsSnapshot('starting-route', {
+      source: { bytes_in_total: 1000 },
+    });
+
+    await openStatsDrawer();
+
+    const [resetTrigger] = screen.getAllByRole('button', { name: /^reset$/i });
+    fireEvent.click(resetTrigger);
+    const resetButtons = await screen.findAllByRole('button', { name: /^reset$/i });
+    fireEvent.click(resetButtons[resetButtons.length - 1]);
+
+    expect(await screen.findByText('No statistics received yet')).toBeInTheDocument();
+  });
+
+  it('shows a warning when since_reset has rebased_at', async () => {
+    renderRoutes();
+
+    emitStatsSnapshot('starting-route', {
+      since_reset: {
+        reset_at: '2026-05-15T10:00:00.000000Z',
+        rebased_at: '2026-05-15T11:30:00.000000Z',
+        source: { bytes_in_total: 12345 },
+        destinations: [],
+      },
+    });
+
+    await openStatsDrawer();
+
+    expect(screen.getByText(/Counters restarted at/i)).toBeInTheDocument();
+    expect(screen.getByText(/not since the reset/i)).toBeInTheDocument();
   });
 
 });

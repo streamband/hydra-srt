@@ -6,12 +6,13 @@ import {
   Legend,
   Line,
   LineChart,
+  ReferenceLine,
   ResponsiveContainer,
   Tooltip as ChartTooltip,
   XAxis,
   YAxis,
 } from 'recharts';
-import type { RouteEndpoint, SrtHealthPoint } from '../../types/routes';
+import type { RouteEndpoint, SrtHealthPoint, SrtTotalsEntry, StatsResetMarker } from '../../types/routes';
 
 const { Text, Title } = Typography;
 
@@ -20,9 +21,18 @@ type Props = {
   destinations: RouteEndpoint[];
   activeSourceId?: string;
   points: SrtHealthPoint[];
+  totals?: SrtTotalsEntry[];
+  resets?: StatsResetMarker[];
   loading: boolean;
   error: string | null;
   routeActive?: boolean;
+};
+
+type ChartSeries = {
+  key: keyof SrtHealthPoint;
+  name: string;
+  color: string;
+  maxKey?: keyof SrtHealthPoint;
 };
 
 const isSrt = (endpoint: RouteEndpoint) =>
@@ -40,21 +50,43 @@ const formatTimestamp = (value?: string) => {
 const numeric = (value: number | null | undefined) =>
   typeof value === 'number' && Number.isFinite(value) ? value : null;
 
+const formatCount = (value: number | null | undefined) => {
+  const n = numeric(value);
+  return n == null ? '-' : n.toLocaleString();
+};
+
+const formatBytes = (value: number | null | undefined): string => {
+  const n = numeric(value);
+  if (n == null) return '-';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let normalized = Math.max(0, n);
+  let unitIndex = 0;
+  while (normalized >= 1000 && unitIndex < units.length - 1) {
+    normalized /= 1000;
+    unitIndex += 1;
+  }
+  const precision = normalized >= 100 ? 0 : normalized >= 10 ? 1 : 2;
+  return `${normalized.toFixed(precision)} ${units[unitIndex]}`;
+};
+
+const PEAK_LINE_HELP =
+  ' Solid line: bucket average. Dashed line: highest one-second sample in the bucket.';
+
 const METRIC_HELP = {
-  rtt: 'Smoothed round-trip time (SRTT), calculated as an EWMA of RTT samples. Unit: milliseconds. Available for sender and receiver.',
-  senderLoss: 'Percentage derived from sender-side DATA packets considered or reported lost during the interval.',
-  receiverLoss: 'Percentage derived from receiver-side DATA packets detected as presently missing during the interval.',
+  rtt: `Smoothed round-trip time (SRTT), calculated as an EWMA of RTT samples. Unit: milliseconds. Available for sender and receiver.${PEAK_LINE_HELP}`,
+  senderLoss: `Percentage derived from sender-side DATA packets considered or reported lost during the interval.${PEAK_LINE_HELP}`,
+  receiverLoss: `Percentage derived from receiver-side DATA packets detected as presently missing during the interval.${PEAK_LINE_HELP}`,
   senderLatency: 'Timestamp-based packet delivery delay reported by the sender for its peer receiver. Unit: milliseconds.',
   receiverLatency: 'Timestamp-based packet delivery delay configured on the receiver socket. Unit: milliseconds.',
   bandwidth: 'Estimated network-link bandwidth. The receiver estimates it from probe-packet arrival spacing and reports the running average to the sender. Unit: Mbps.',
   sendRate: 'SRT sending rate measured for the statistics interval. Sender side. Unit: Mbps.',
   receiveRate: 'SRT receiving rate measured for the statistics interval. Receiver side. Unit: Mbps.',
-  senderRetransmitted: 'Number of retransmitted DATA packets sent by the SRT sender during the interval.',
-  receiverRetransmitted: 'Number of retransmitted DATA packets registered by the SRT receiver during the interval.',
-  senderDropped: 'Sender-side DATA packets dropped because they could not be delivered in time during the interval.',
-  receiverDropped: 'Receiver-side DATA packets dropped and therefore not delivered to the upstream application during the interval.',
-  senderNak: 'NAK (Negative Acknowledgement) control packets received by the sender during the interval.',
-  receiverNak: 'NAK (Negative Acknowledgement) control packets sent by the receiver during the interval.',
+  senderRetransmitted: `Number of retransmitted DATA packets sent by the SRT sender during the interval.${PEAK_LINE_HELP}`,
+  receiverRetransmitted: `Number of retransmitted DATA packets registered by the SRT receiver during the interval.${PEAK_LINE_HELP}`,
+  senderDropped: `Sender-side DATA packets dropped because they could not be delivered in time during the interval.${PEAK_LINE_HELP}`,
+  receiverDropped: `Receiver-side DATA packets dropped and therefore not delivered to the upstream application during the interval.${PEAK_LINE_HELP}`,
+  senderNak: `NAK (Negative Acknowledgement) control packets received by the sender during the interval.${PEAK_LINE_HELP}`,
+  receiverNak: `NAK (Negative Acknowledgement) control packets sent by the receiver during the interval.${PEAK_LINE_HELP}`,
 } as const;
 
 const STATISTICS_URL = 'https://github.com/Haivision/srt/blob/master/docs/API/statistics.md';
@@ -110,6 +142,8 @@ const SrtHealthTab = ({
   destinations,
   activeSourceId,
   points,
+  totals = [],
+  resets = [],
   loading,
   error,
   routeActive = true,
@@ -145,6 +179,59 @@ const SrtHealthTab = ({
         .map((point) => ({ ...point, time: formatTimestamp(point.timestamp) })),
     [entityId, entityType, points],
   );
+  const selectedTotals = useMemo(
+    () => totals.find((entry) => entry.entity_type === entityType && entry.entity_id === entityId),
+    [entityId, entityType, totals],
+  );
+  const chartResetMarkers = useMemo(() => {
+    if (resets.length === 0 || selectedPoints.length === 0) {
+      return [];
+    }
+
+    const minTs = Date.parse(selectedPoints[0].timestamp || '');
+    const maxTs = Date.parse(selectedPoints[selectedPoints.length - 1].timestamp || '');
+    if (Number.isNaN(minTs) || Number.isNaN(maxTs)) {
+      return [];
+    }
+
+    return resets.flatMap((reset, index) => {
+      const resetTs = Date.parse(reset.timestamp || '');
+      if (Number.isNaN(resetTs) || resetTs < minTs || resetTs > maxTs) {
+        return [];
+      }
+
+      let nearest = selectedPoints[0];
+      let nearestDiff = Math.abs(Date.parse(nearest.timestamp || '') - resetTs);
+      for (const point of selectedPoints) {
+        const pointTs = Date.parse(point.timestamp || '');
+        if (Number.isNaN(pointTs)) {
+          continue;
+        }
+        const diff = Math.abs(pointTs - resetTs);
+        if (diff < nearestDiff) {
+          nearest = point;
+          nearestDiff = diff;
+        }
+      }
+
+      if (!nearest.time) {
+        return [];
+      }
+
+      const reason = String(reset.reason || '').toLowerCase();
+      const label = reason === 'cleared' ? 'C' : 'R';
+
+      return [{
+        key: `reset-${reset.timestamp}-${index}`,
+        time: nearest.time,
+        label,
+      }];
+    });
+  }, [resets, selectedPoints]);
+
+  const hasMaxData = (maxKey: keyof SrtHealthPoint) =>
+    selectedPoints.some((point) => numeric(point[maxKey] as number | null | undefined) != null);
+
   const latest = selectedPoints[selectedPoints.length - 1];
   const displayLatest = routeActive ? latest : undefined;
   const bandwidth = numeric(displayLatest?.bandwidth_mbps);
@@ -159,6 +246,13 @@ const SrtHealthTab = ({
       : METRIC_HELP.senderRetransmitted,
     Dropped: isReceiver ? METRIC_HELP.receiverDropped : METRIC_HELP.senderDropped,
     NAK: isReceiver ? METRIC_HELP.receiverNak : METRIC_HELP.senderNak,
+    'RTT (peak)': METRIC_HELP.rtt,
+    'Loss (peak)': isReceiver ? METRIC_HELP.receiverLoss : METRIC_HELP.senderLoss,
+    'Retransmitted (peak)': isReceiver
+      ? METRIC_HELP.receiverRetransmitted
+      : METRIC_HELP.senderRetransmitted,
+    'Dropped (peak)': isReceiver ? METRIC_HELP.receiverDropped : METRIC_HELP.senderDropped,
+    'NAK (peak)': isReceiver ? METRIC_HELP.receiverNak : METRIC_HELP.senderNak,
   };
   const metricAnchors: Record<string, string> = {
     'Receive rate': 'mbpsrecvrate',
@@ -167,6 +261,11 @@ const SrtHealthTab = ({
     Retransmitted: isReceiver ? 'pktrcvretrans' : 'pktretrans',
     Dropped: isReceiver ? 'pktrcvdrop' : 'pktsnddrop',
     NAK: isReceiver ? 'pktsentnak' : 'pktrecvnak',
+    'RTT (peak)': 'msrtt',
+    'Loss (peak)': isReceiver ? 'pktrcvloss' : 'pktsndloss',
+    'Retransmitted (peak)': isReceiver ? 'pktrcvretrans' : 'pktretrans',
+    'Dropped (peak)': isReceiver ? 'pktrcvdrop' : 'pktsnddrop',
+    'NAK (peak)': isReceiver ? 'pktsentnak' : 'pktrecvnak',
   };
 
   if (srtSources.length === 0 && srtDestinations.length === 0) {
@@ -194,8 +293,18 @@ const SrtHealthTab = ({
       : []),
   ];
 
+  const resetMarkerLines = chartResetMarkers.map((marker) => (
+    <ReferenceLine
+      key={marker.key}
+      x={marker.time}
+      stroke="#8c8c8c"
+      strokeDasharray="3 3"
+      label={{ value: marker.label, position: 'top', fill: '#8c8c8c', fontSize: 10 }}
+    />
+  ));
+
   const chart = (
-    dataKeys: Array<{ key: keyof SrtHealthPoint; name: string; color: string }>,
+    dataKeys: ChartSeries[],
     unit: string,
   ) => (
     <div style={{ width: '100%', height: 240 }}>
@@ -216,18 +325,38 @@ const SrtHealthTab = ({
               )}
             />
           )}
-          {dataKeys.map((item) => (
-            <Line
-              key={String(item.key)}
-              type="monotone"
-              dataKey={item.key}
-              name={item.name}
-              stroke={item.color}
-              dot={false}
-              connectNulls
-              isAnimationActive={false}
-            />
-          ))}
+          {dataKeys.flatMap((item) => {
+            const lines = [
+              <Line
+                key={String(item.key)}
+                type="monotone"
+                dataKey={item.key}
+                name={item.name}
+                stroke={item.color}
+                dot={false}
+                connectNulls
+                isAnimationActive={false}
+              />,
+            ];
+            if (item.maxKey && hasMaxData(item.maxKey)) {
+              lines.push(
+                <Line
+                  key={String(item.maxKey)}
+                  type="monotone"
+                  dataKey={item.maxKey}
+                  name={`${item.name} (peak)`}
+                  stroke={item.color}
+                  strokeDasharray="3 3"
+                  strokeOpacity={0.55}
+                  dot={false}
+                  connectNulls
+                  isAnimationActive={false}
+                />,
+              );
+            }
+            return lines;
+          })}
+          {resetMarkerLines}
         </LineChart>
       </ResponsiveContainer>
     </div>
@@ -293,6 +422,7 @@ const SrtHealthTab = ({
             connectNulls
             isAnimationActive={false}
           />
+          {resetMarkerLines}
         </LineChart>
       </ResponsiveContainer>
     </div>
@@ -322,6 +452,60 @@ const SrtHealthTab = ({
 
       {selectedPoints.length > 0 && (
         <>
+          {selectedTotals && (
+            <div>
+              <Title level={5}>Totals for the selected window</Title>
+              <Text type="secondary">
+                Increases over the selected time range from cumulative SRT counters, unaffected by chart smoothing.
+              </Text>
+              <Row gutter={[12, 12]} style={{ marginTop: 12 }}>
+                <Col xs={12} lg={6} xl={4}>
+                  <Card size="small">
+                    <Statistic title="Packets" value={formatCount(selectedTotals.packets_total)} />
+                  </Card>
+                </Col>
+                <Col xs={12} lg={6} xl={4}>
+                  <Card size="small">
+                    <Statistic title="Lost" value={formatCount(selectedTotals.packets_lost_total)} />
+                  </Card>
+                </Col>
+                <Col xs={12} lg={6} xl={4}>
+                  <Card size="small">
+                    <Statistic
+                      title="Retransmitted"
+                      value={formatCount(selectedTotals.packets_retransmitted_total)}
+                    />
+                  </Card>
+                </Col>
+                <Col xs={12} lg={6} xl={4}>
+                  <Card size="small">
+                    <Statistic title="Dropped" value={formatCount(selectedTotals.packets_dropped_total)} />
+                  </Card>
+                </Col>
+                <Col xs={12} lg={6} xl={4}>
+                  <Card size="small">
+                    <Statistic title="NAK" value={formatCount(selectedTotals.nack_total)} />
+                  </Card>
+                </Col>
+                <Col xs={12} lg={6} xl={4}>
+                  <Card size="small">
+                    <Statistic title="Bytes" value={formatBytes(selectedTotals.bytes_total)} />
+                  </Card>
+                </Col>
+                <Col xs={12} lg={6} xl={4}>
+                  <Card size="small">
+                    <Statistic
+                      title="Loss %"
+                      value={numeric(selectedTotals.loss_percent) ?? '-'}
+                      precision={2}
+                      suffix={numeric(selectedTotals.loss_percent) != null ? '%' : undefined}
+                    />
+                  </Card>
+                </Col>
+              </Row>
+            </div>
+          )}
+
           <div>
             <Title level={5}>
               <MetricTitle
@@ -408,7 +592,7 @@ const SrtHealthTab = ({
                   <MetricTitle label="Round-trip time" help={METRIC_HELP.rtt} anchor="msrtt" />
                 }
               >
-                {chart([{ key: 'rtt_ms', name: 'RTT', color: '#1677ff' }], ' ms')}
+                {chart([{ key: 'rtt_ms', name: 'RTT', color: '#1677ff', maxKey: 'rtt_ms_max' }], ' ms')}
               </Card>
             </Col>
             <Col xs={24} xl={12}>
@@ -422,7 +606,12 @@ const SrtHealthTab = ({
                   />
                 }
               >
-                {chart([{ key: 'packet_loss_percent', name: 'Loss', color: '#ff4d4f' }], '%')}
+                {chart([{
+                  key: 'packet_loss_percent',
+                  name: 'Loss',
+                  color: '#ff4d4f',
+                  maxKey: 'packet_loss_percent_max',
+                }], '%')}
               </Card>
             </Col>
             <Col span={24}>
@@ -457,9 +646,24 @@ const SrtHealthTab = ({
             <Text type="secondary">Interval rates reported by the selected SRT socket.</Text>
             <Card size="small" style={{ marginTop: 12 }}>
               {chart([
-                { key: 'retransmitted_packets_per_sec', name: 'Retransmitted', color: '#faad14' },
-                { key: 'dropped_packets_per_sec', name: 'Dropped', color: '#ff4d4f' },
-                { key: 'nack_packets_per_sec', name: 'NAK', color: '#722ed1' },
+                {
+                  key: 'retransmitted_packets_per_sec',
+                  name: 'Retransmitted',
+                  color: '#faad14',
+                  maxKey: 'retransmitted_packets_per_sec_max',
+                },
+                {
+                  key: 'dropped_packets_per_sec',
+                  name: 'Dropped',
+                  color: '#ff4d4f',
+                  maxKey: 'dropped_packets_per_sec_max',
+                },
+                {
+                  key: 'nack_packets_per_sec',
+                  name: 'NAK',
+                  color: '#722ed1',
+                  maxKey: 'nack_packets_per_sec_max',
+                },
               ], '/s')}
             </Card>
           </div>

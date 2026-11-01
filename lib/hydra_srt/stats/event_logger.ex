@@ -37,6 +37,24 @@ defmodule HydraSrt.Stats.EventLogger do
     })
   end
 
+  @spec log_stats_reset(binary(), binary()) :: :ok
+  def log_stats_reset(route_id, action) when action in ["set", "cleared"] do
+    message =
+      case action do
+        "set" -> "Route statistics reset"
+        "cleared" -> "Route statistics reset cleared"
+      end
+
+    ingest(%{
+      route_id: route_id,
+      event_type: "stats_reset",
+      severity: "info",
+      reason: action,
+      message: message,
+      details_json: Jason.encode!(%{action: action})
+    })
+  end
+
   def log_pipeline_failed(route_id, source_id, reason, message) do
     log_source_event(route_id, source_id, "pipeline_failed", "error", reason, message)
   end
